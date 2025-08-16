@@ -10,6 +10,14 @@ The core stack used in these tutorials is:
 
 You'll also need to have the [Vulkan SDK](https://www.lunarg.com/vulkan-sdk/) installed on your machine to run this code.
 
+## Running the chapters
+
+To run the code, specify a chapter with the `--bin` flag, e.g.:
+
+```
+cargo run --bin chapter1
+```
+
 ## Disclaimer
 
 There are no guarantees that this code works on any other platforms other than Windows 10. Feel free to create a pull request to add cross-compatibility if you want, but don't expect any help from me on this front.
