@@ -32,3 +32,7 @@ anyhow = "1.0.99"
 [[bin]]
 name = "chapter1"
 path = "src/chapter1/main.rs"
+
+[[bin]]
+name = "chapter2"
+path = "src/chapter2/main.rs"
