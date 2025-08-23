@@ -91,8 +91,6 @@ impl Engine {
 
         create_sync_objects(&device, &mut state)?;
 
-        let allocator = create_allocator(&instance, state.physical_device, &device)?;
-
         Ok(Self {
             entry,
             instance,

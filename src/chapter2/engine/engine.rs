@@ -10,6 +10,10 @@ use std::collections::HashSet;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
+use vkguide_rs::vulkan::descriptors::{
+    PoolSizeRatio, allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
+};
+use vkguide_rs::vulkan::pipelines::create_shader_module;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::{raw_window_handle::HasDisplayHandle, window::Window};
 
@@ -57,6 +61,11 @@ pub struct EngineState {
     current_semaphore: usize,
     frame_number: usize,
     draw_image: AllocatedImage,
+    descriptor_pool: vk::DescriptorPool,
+    draw_image_descriptors: Vec<vk::DescriptorSet>,
+    draw_image_descriptor_layout: vk::DescriptorSetLayout,
+    gradient_pipeline_layout: vk::PipelineLayout,
+    gradient_pipeline: vk::Pipeline,
 }
 
 const FRAME_OVERLAP: usize = 2;
@@ -108,6 +117,10 @@ impl Engine {
         create_commands(&device, &mut state)?;
 
         create_sync_objects(&device, &mut state)?;
+
+        setup_descriptors(&device, &mut state)?;
+
+        create_background_pipelines(&device, &mut state)?;
 
         Ok(Self {
             entry,
@@ -272,6 +285,9 @@ impl Engine {
 
     fn destroy_swapchain(&mut self) {
         unsafe {
+            self.device
+                .destroy_descriptor_pool(self.state.descriptor_pool, None);
+
             self.state
                 .swapchain_image_views
                 .iter()
@@ -282,6 +298,11 @@ impl Engine {
                 .as_mut()
                 .unwrap()
                 .destroy_swapchain(self.state.swapchain, None);
+
+            self.device
+                .destroy_pipeline_layout(self.state.gradient_pipeline_layout, None);
+            self.device
+                .destroy_pipeline(self.state.gradient_pipeline, None);
         }
     }
 
@@ -313,6 +334,9 @@ impl Engine {
             }
 
             self.destroy_swapchain();
+
+            self.device
+                .destroy_descriptor_set_layout(self.state.draw_image_descriptor_layout, None);
 
             self.state
                 .frames
@@ -774,26 +798,109 @@ pub fn create_allocator(
 // #region Draw
 
 pub fn draw_background(device: &Device, cmd: vk::CommandBuffer, state: &EngineState) -> Result<()> {
-    let flash = f32::abs(f32::sin((state.frame_number / 120) as f32));
-    let clear_color = vk::ClearColorValue {
-        float32: [0.0, 0.0, flash, 1.0],
+    unsafe {
+        // bind the compute pipeline
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, state.gradient_pipeline);
+
+        // bind the descriptor sets
+        device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            state.gradient_pipeline_layout,
+            0,
+            &state.draw_image_descriptors[..],
+            &[],
+        );
+
+        device.cmd_dispatch(
+            cmd,
+            f32::ceil(state.draw_image.extent.width as f32 / 16.0) as u32,
+            f32::ceil(state.draw_image.extent.height as f32 / 16.0) as u32,
+            1,
+        );
+    }
+
+    Ok(())
+}
+
+// #endregion
+
+// #region Descriptors
+
+pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()> {
+    let sizes = vec![PoolSizeRatio::new(vk::DescriptorType::STORAGE_IMAGE, 1f32)];
+
+    let pool = create_descriptor_pool(device, 10, sizes)?;
+
+    let image_binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .descriptor_count(1)
+        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE);
+
+    let layout = create_descriptor_set_layout(
+        device,
+        &[image_binding],
+        vk::DescriptorSetLayoutCreateFlags::empty(),
+    )?;
+
+    // allocate a descriptor set for the draw image
+    state.draw_image_descriptors = allocate_descriptor_sets(device, pool, layout)?;
+
+    let image_info = &[vk::DescriptorImageInfo::default()
+        .image_layout(vk::ImageLayout::GENERAL)
+        .image_view(state.draw_image.image_view)];
+
+    let image_write = vk::WriteDescriptorSet::default()
+        .dst_set(state.draw_image_descriptors[0])
+        .dst_binding(0)
+        .image_info(image_info)
+        .descriptor_count(1)
+        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE);
+
+    let image_writes = &[image_write];
+
+    unsafe { device.update_descriptor_sets(image_writes, &[] as &[vk::CopyDescriptorSet]) };
+
+    state.draw_image_descriptor_layout = layout;
+    state.descriptor_pool = pool;
+
+    Ok(())
+}
+
+// #endregion
+
+// #region Pipelines
+
+pub fn create_background_pipelines(device: &Device, state: &mut EngineState) -> Result<()> {
+    let layouts = &[state.draw_image_descriptor_layout];
+    let compute_layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(layouts);
+
+    state.gradient_pipeline_layout =
+        unsafe { device.create_pipeline_layout(&compute_layout_info, None)? };
+
+    let compute_shader_src = include_bytes!("../../../shaders/out/gradient_comp.spv");
+    let compute_module = create_shader_module(device, &compute_shader_src[..])?;
+
+    let compute_shader_stage = vk::PipelineShaderStageCreateInfo::default()
+        .module(compute_module)
+        .name(c"main")
+        .stage(vk::ShaderStageFlags::COMPUTE);
+
+    let compute_pipeline_info = vk::ComputePipelineCreateInfo::default()
+        .layout(state.gradient_pipeline_layout)
+        .stage(compute_shader_stage);
+
+    let compute_pipeline_infos = &[compute_pipeline_info];
+
+    state.gradient_pipeline = unsafe {
+        device
+            .create_compute_pipelines(vk::PipelineCache::null(), compute_pipeline_infos, None)
+            .expect("failed to create compute pipeline")[0]
     };
 
-    let clear_range = vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(vk::REMAINING_MIP_LEVELS)
-        .base_array_layer(0)
-        .layer_count(vk::REMAINING_ARRAY_LAYERS);
-
     unsafe {
-        device.cmd_clear_color_image(
-            cmd,
-            state.draw_image.image,
-            vk::ImageLayout::GENERAL,
-            &clear_color,
-            &[clear_range],
-        );
+        device.destroy_shader_module(compute_module, None);
     }
 
     Ok(())
