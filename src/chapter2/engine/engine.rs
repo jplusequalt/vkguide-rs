@@ -4,7 +4,6 @@ use anyhow::{Result, anyhow};
 use ash::khr::{surface, synchronization2};
 use ash::vk::{ImageAspectFlags, ImageUsageFlags};
 use ash::{Device, Entry, Instance, ext::debug_utils, vk};
-use egui::Context;
 use egui_ash_renderer::Renderer;
 use gpu_allocator::vulkan::Allocator;
 use log::*;
@@ -224,7 +223,6 @@ impl Engine {
             shapes,
             textures_delta,
             pixels_per_point,
-            viewport_output,
             ..
         } = egui_ctx.end_pass();
 
@@ -426,6 +424,7 @@ impl Engine {
             self.device.device_wait_idle()?;
 
             let allocation = std::mem::take(&mut self.state.draw_image);
+            
             cleanup_image(
                 allocation,
                 self.allocator
@@ -436,6 +435,10 @@ impl Engine {
                     .unwrap(),
                 &self.device,
             )?;
+
+            self.state.egui_state = None;
+
+            let _ = self.egui_renderer;
 
             self.state.frames.iter_mut().for_each(|f| {
                 self.device.destroy_fence(f.render_fence, None);
