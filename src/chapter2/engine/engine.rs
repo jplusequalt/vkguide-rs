@@ -4,6 +4,8 @@ use anyhow::{Result, anyhow};
 use ash::khr::{surface, synchronization2};
 use ash::vk::{ImageAspectFlags, ImageUsageFlags};
 use ash::{Device, Entry, Instance, ext::debug_utils, vk};
+use egui::Context;
+use egui_ash_renderer::Renderer;
 use gpu_allocator::vulkan::Allocator;
 use log::*;
 use std::collections::HashSet;
@@ -36,6 +38,7 @@ pub struct Engine {
     device: Device,
     state: EngineState,
     allocator: Option<Arc<Mutex<Allocator>>>,
+    egui_renderer: Renderer,
 }
 
 #[derive(Default)]
@@ -66,6 +69,7 @@ pub struct EngineState {
     draw_image_descriptor_layout: vk::DescriptorSetLayout,
     gradient_pipeline_layout: vk::PipelineLayout,
     gradient_pipeline: vk::Pipeline,
+    egui_state: Option<egui_winit::State>,
 }
 
 const FRAME_OVERLAP: usize = 2;
@@ -122,12 +126,43 @@ impl Engine {
 
         create_background_pipelines(&device, &mut state)?;
 
+        let gui_context = egui::Context::default();
+        gui_context.set_pixels_per_point(window.scale_factor() as _);
+
+        let viewport_id = gui_context.viewport_id();
+        let gui_state = egui_winit::State::new(
+            gui_context,
+            viewport_id,
+            &window,
+            Some(window.scale_factor() as _),
+            Some(winit::window::Theme::Dark),
+            None,
+        );
+
+        egui_extras::install_image_loaders(gui_state.egui_ctx());
+
+        let egui_renderer = Renderer::with_gpu_allocator(
+            allocator.clone(),
+            device.clone(),
+            egui_ash_renderer::DynamicRendering {
+                color_attachment_format: state.swapchain_format,
+                depth_attachment_format: None,
+            },
+            egui_ash_renderer::Options {
+                in_flight_frames: FRAME_OVERLAP,
+                ..Default::default()
+            },
+        )?;
+
+        state.egui_state = Some(gui_state);
+
         Ok(Self {
             entry,
             instance,
             device,
             state,
             allocator: Some(allocator),
+            egui_renderer,
         })
     }
 
@@ -136,7 +171,11 @@ impl Engine {
     pub fn render(&mut self, window: &Window) -> Result<()> {
         window.request_redraw();
 
-        let frame = self.get_current_frame().unwrap();
+        let frame = self
+            .state
+            .frames
+            .get(self.state.frame_number % FRAME_OVERLAP)
+            .unwrap();
 
         // wait till the last frame is finished rendering before continuing
         unsafe {
@@ -165,6 +204,45 @@ impl Engine {
             self.device
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?
         };
+
+        let gui_input = self
+            .state
+            .egui_state
+            .as_mut()
+            .unwrap()
+            .take_egui_input(window);
+
+        let egui_ctx = self.state.egui_state.as_ref().unwrap().egui_ctx().clone();
+
+        egui_ctx.begin_pass(gui_input);
+        egui::Window::new("Hello World").show(&egui_ctx, |ui| {
+            ui.heading("Hello World");
+        });
+
+        let egui::FullOutput {
+            platform_output,
+            shapes,
+            textures_delta,
+            pixels_per_point,
+            viewport_output,
+            ..
+        } = egui_ctx.end_pass();
+
+        self.state
+            .egui_state
+            .as_mut()
+            .unwrap()
+            .handle_platform_output(window, platform_output);
+
+        let primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+
+        if !textures_delta.set.is_empty() {
+            self.egui_renderer.set_textures(
+                self.state.graphics_queue,
+                frame.command_pool,
+                textures_delta.set.as_slice(),
+            )?;
+        }
 
         let cmd_begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -217,13 +295,46 @@ impl Engine {
             extent,
         )?;
 
-        // transition swapchain to present mode
         transition_image(
             &self.device,
             cmd,
             image,
             ImageAspectFlags::COLOR,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        )?;
+
+        let color_attachment_info = vk::RenderingAttachmentInfo::default()
+            .image_view(self.state.swapchain_image_views[image_index as usize])
+            .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+            .store_op(vk::AttachmentStoreOp::STORE);
+
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.state.swapchain_extent,
+            })
+            .layer_count(1)
+            .color_attachments(std::slice::from_ref(&color_attachment_info));
+
+        unsafe { self.device.cmd_begin_rendering(cmd, &rendering_info) };
+
+        self.egui_renderer.cmd_draw(
+            cmd,
+            self.state.swapchain_extent,
+            pixels_per_point,
+            &primitives,
+        )?;
+
+        unsafe { self.device.cmd_end_rendering(cmd) };
+
+        // transition swapchain to present mode
+        transition_image(
+            &self.device,
+            cmd,
+            image,
+            ImageAspectFlags::COLOR,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::PRESENT_SRC_KHR,
         )?;
 
@@ -277,6 +388,10 @@ impl Engine {
         self.state.current_semaphore =
             (self.state.current_semaphore + 1) % self.state.swapchain_image_views.len();
         self.state.frame_number += 1;
+
+        if !textures_delta.free.is_empty() {
+            self.egui_renderer.free_textures(&textures_delta.free)?;
+        }
 
         Ok(())
     }
