@@ -11,6 +11,8 @@ use std::collections::HashSet;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use vkguide_rs::utils::fps::FPSCounter;
 use vkguide_rs::vulkan::descriptors::{
     PoolSizeRatio, allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
 };
@@ -37,7 +39,8 @@ pub struct Engine {
     device: Device,
     state: EngineState,
     allocator: Option<Arc<Mutex<Allocator>>>,
-    egui_renderer: Renderer,
+    egui_renderer: Option<Renderer>,
+    delta_time: Instant,
 }
 
 #[derive(Default)]
@@ -69,6 +72,7 @@ pub struct EngineState {
     gradient_pipeline_layout: vk::PipelineLayout,
     gradient_pipeline: vk::Pipeline,
     egui_state: Option<egui_winit::State>,
+    fps: FPSCounter,
 }
 
 const FRAME_OVERLAP: usize = 2;
@@ -85,6 +89,7 @@ impl Engine {
         let entry = Entry::linked();
 
         let mut state = EngineState::default();
+        state.fps = FPSCounter::new(60);
 
         let instance = create_instance(&entry, window, &mut state)?;
 
@@ -161,7 +166,8 @@ impl Engine {
             device,
             state,
             allocator: Some(allocator),
-            egui_renderer,
+            egui_renderer: Some(egui_renderer),
+            delta_time: Instant::now(),
         })
     }
 
@@ -169,6 +175,13 @@ impl Engine {
 
     pub fn render(&mut self, window: &Window) -> Result<()> {
         window.request_redraw();
+
+        let new_time = Instant::now();
+        let frame_time = new_time.duration_since(self.delta_time).as_secs_f32() * 1000.0;
+        self.delta_time = new_time;
+
+        self.state.fps.add_frame_time(frame_time);
+        let fps_avg = self.state.fps.get_fps();
 
         let frame = self
             .state
@@ -214,8 +227,8 @@ impl Engine {
         let egui_ctx = self.state.egui_state.as_ref().unwrap().egui_ctx().clone();
 
         egui_ctx.begin_pass(gui_input);
-        egui::Window::new("Hello World").show(&egui_ctx, |ui| {
-            ui.heading("Hello World");
+        egui::Window::new("FPS Counter").show(&egui_ctx, |ui| {
+            ui.heading(format!("{:.2} fps", fps_avg));
         });
 
         let egui::FullOutput {
@@ -235,7 +248,7 @@ impl Engine {
         let primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
         if !textures_delta.set.is_empty() {
-            self.egui_renderer.set_textures(
+            self.egui_renderer.as_mut().unwrap().set_textures(
                 self.state.graphics_queue,
                 frame.command_pool,
                 textures_delta.set.as_slice(),
@@ -317,7 +330,7 @@ impl Engine {
 
         unsafe { self.device.cmd_begin_rendering(cmd, &rendering_info) };
 
-        self.egui_renderer.cmd_draw(
+        self.egui_renderer.as_mut().unwrap().cmd_draw(
             cmd,
             self.state.swapchain_extent,
             pixels_per_point,
@@ -388,7 +401,7 @@ impl Engine {
         self.state.frame_number += 1;
 
         if !textures_delta.free.is_empty() {
-            self.egui_renderer.free_textures(&textures_delta.free)?;
+            self.egui_renderer.as_mut().unwrap().free_textures(&textures_delta.free)?;
         }
 
         Ok(())
@@ -424,7 +437,7 @@ impl Engine {
             self.device.device_wait_idle()?;
 
             let allocation = std::mem::take(&mut self.state.draw_image);
-            
+
             cleanup_image(
                 allocation,
                 self.allocator
@@ -437,8 +450,7 @@ impl Engine {
             )?;
 
             self.state.egui_state = None;
-
-            let _ = self.egui_renderer;
+            self.egui_renderer = None;
 
             self.state.frames.iter_mut().for_each(|f| {
                 self.device.destroy_fence(f.render_fence, None);

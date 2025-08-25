@@ -45,13 +45,12 @@ impl ApplicationHandler for App {
             .unwrap();
 
         let engine = Engine::create(&window).unwrap();
-        
+
         self.window = Some(window);
         self.engine = Some(engine);
-
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {      
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Exiting ...");
