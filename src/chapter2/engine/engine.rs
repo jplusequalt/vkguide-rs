@@ -137,35 +137,7 @@ impl Engine {
 
         create_background_pipelines(&device, &mut state)?;
 
-        let gui_context = egui::Context::default();
-        gui_context.set_pixels_per_point(window.scale_factor() as _);
-
-        let viewport_id = gui_context.viewport_id();
-        let gui_state = egui_winit::State::new(
-            gui_context,
-            viewport_id,
-            &window,
-            Some(window.scale_factor() as _),
-            Some(winit::window::Theme::Dark),
-            None,
-        );
-
-        egui_extras::install_image_loaders(gui_state.egui_ctx());
-
-        let egui_renderer = Renderer::with_gpu_allocator(
-            allocator.clone(),
-            device.clone(),
-            egui_ash_renderer::DynamicRendering {
-                color_attachment_format: state.swapchain_format,
-                depth_attachment_format: None,
-            },
-            egui_ash_renderer::Options {
-                in_flight_frames: FRAME_OVERLAP,
-                ..Default::default()
-            },
-        )?;
-
-        state.egui_state = Some(gui_state);
+        let egui_renderer = setup_egui(window, &device, &allocator, &mut state)?;
 
         Ok(Self {
             entry,
@@ -1108,6 +1080,49 @@ pub fn create_background_pipelines(device: &Device, state: &mut EngineState) -> 
     }
 
     Ok(())
+}
+
+// #endregion
+
+// #region egui
+
+pub fn setup_egui(
+    window: &Window,
+    device: &Device,
+    allocator: &Arc<Mutex<Allocator>>,
+    state: &mut EngineState,
+) -> Result<Renderer> {
+    let gui_context = egui::Context::default();
+    gui_context.set_pixels_per_point(window.scale_factor() as _);
+
+    let viewport_id = gui_context.viewport_id();
+    let gui_state = egui_winit::State::new(
+        gui_context,
+        viewport_id,
+        &window,
+        Some(window.scale_factor() as _),
+        Some(winit::window::Theme::Dark),
+        None,
+    );
+
+    egui_extras::install_image_loaders(gui_state.egui_ctx());
+
+    let egui_renderer = Renderer::with_gpu_allocator(
+        allocator.clone(),
+        device.clone(),
+        egui_ash_renderer::DynamicRendering {
+            color_attachment_format: state.swapchain_format,
+            depth_attachment_format: None,
+        },
+        egui_ash_renderer::Options {
+            in_flight_frames: FRAME_OVERLAP,
+            ..Default::default()
+        },
+    )?;
+
+    state.egui_state = Some(gui_state);
+
+    Ok(egui_renderer)
 }
 
 // #endregion
