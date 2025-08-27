@@ -1,17 +1,31 @@
-#![allow(unused_imports, dead_code)]
+#![allow(dead_code)]
 
 use anyhow::{Result, anyhow};
 use ash::khr::{surface, synchronization2};
-use ash::vk::{Handle, ImageAspectFlags};
+use ash::vk::{ImageAspectFlags, ImageUsageFlags};
 use ash::{Device, Entry, Instance, ext::debug_utils, vk};
+use bytemuck::{Pod, Zeroable};
+use egui_ash_renderer::Renderer;
+use glam::Vec4;
+use gpu_allocator::vulkan::Allocator;
 use log::*;
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::os::raw::c_void;
-use std::{collections::HashSet, time::Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use vkguide_rs::utils::fps::FPSCounter;
+use vkguide_rs::vulkan::descriptors::{
+    PoolSizeRatio, allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
+};
+use vkguide_rs::vulkan::pipelines::create_shader_module;
+use winit::event::WindowEvent;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::{raw_window_handle::HasDisplayHandle, window::Window};
 
-use vkguide_rs::vulkan::images::{create_image_view, transition_image};
+use vkguide_rs::vulkan::images::{
+    AllocatedImage, blit_image, cleanup_image, create_image, create_image_view, transition_image,
+};
 use vkguide_rs::vulkan::queue::QueueFamilyIndices;
 use vkguide_rs::vulkan::swapchain::SwapchainSupport;
 
@@ -27,6 +41,9 @@ pub struct Engine {
     instance: Instance,
     device: Device,
     state: EngineState,
+    allocator: Option<Arc<Mutex<Allocator>>>,
+    egui_renderer: Option<Renderer>,
+    delta_time: Instant,
 }
 
 #[derive(Default)]
@@ -51,6 +68,16 @@ pub struct EngineState {
     render_semaphore: Vec<vk::Semaphore>,
     current_semaphore: usize,
     frame_number: usize,
+    draw_image: AllocatedImage,
+    descriptor_pool: vk::DescriptorPool,
+    draw_image_descriptors: Vec<vk::DescriptorSet>,
+    draw_image_descriptor_layout: vk::DescriptorSetLayout,
+    gradient_pipeline_layout: vk::PipelineLayout,
+    gradient_pipeline: vk::Pipeline,
+    egui_state: Option<egui_winit::State>,
+    fps: FPSCounter,
+    c1: Vec4,
+    c2: Vec4,
 }
 
 const FRAME_OVERLAP: usize = 2;
@@ -67,6 +94,7 @@ impl Engine {
         let entry = Entry::linked();
 
         let mut state = EngineState::default();
+        state.fps = FPSCounter::new(60);
 
         let instance = create_instance(&entry, window, &mut state)?;
 
@@ -80,23 +108,55 @@ impl Engine {
                 None,
             )?
         };
+        state.c1 = Vec4::new(1.0, 0.0, 0.0, 1.0);
+        state.c2 = Vec4::new(1.0, 0.0, 1.0, 1.0);
 
         select_physical_device_and_queue_indices(&instance, &mut state)?;
 
         let device = create_device(&entry, &instance, &mut state)?;
 
+        let allocator = Arc::new(Mutex::new(create_allocator(
+            &instance,
+            state.physical_device,
+            &device,
+        )?));
+
         create_swapchain(window, &instance, &device, &mut state)?;
+
+        create_draw_image(
+            &device,
+            allocator.lock().as_deref_mut().unwrap(),
+            &mut state,
+        )?;
 
         create_commands(&device, &mut state)?;
 
         create_sync_objects(&device, &mut state)?;
+
+        setup_descriptors(&device, &mut state)?;
+
+        create_background_pipelines(&device, &mut state)?;
+
+        let egui_renderer = setup_egui(window, &device, &allocator, &mut state)?;
 
         Ok(Self {
             entry,
             instance,
             device,
             state,
+            allocator: Some(allocator),
+            egui_renderer: Some(egui_renderer),
+            delta_time: Instant::now(),
         })
+    }
+
+    pub fn egui_window_event(&mut self, window: &Window, event: &WindowEvent) {
+        let _ = self
+            .state
+            .egui_state
+            .as_mut()
+            .unwrap()
+            .on_window_event(window, event);
     }
 
     // #region render
@@ -104,7 +164,18 @@ impl Engine {
     pub fn render(&mut self, window: &Window) -> Result<()> {
         window.request_redraw();
 
-        let frame = self.get_current_frame().unwrap();
+        let new_time = Instant::now();
+        let frame_time = new_time.duration_since(self.delta_time).as_secs_f32() * 1000.0;
+        self.delta_time = new_time;
+
+        self.state.fps.add_frame_time(frame_time);
+        let fps_avg = self.state.fps.get_fps();
+
+        let frame = self
+            .state
+            .frames
+            .get(self.state.frame_number % FRAME_OVERLAP)
+            .unwrap();
 
         // wait till the last frame is finished rendering before continuing
         unsafe {
@@ -134,6 +205,62 @@ impl Engine {
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?
         };
 
+        let gui_input = self
+            .state
+            .egui_state
+            .as_mut()
+            .unwrap()
+            .take_egui_input(window);
+
+        let egui_ctx = self.state.egui_state.as_ref().unwrap().egui_ctx().clone();
+
+        egui_ctx.begin_pass(gui_input);
+        egui::Window::new("Debug GUI").show(&egui_ctx, |ui| {
+            ui.heading(format!("{:.2} fps", fps_avg));
+
+            egui::ComboBox::from_label("1")
+                .selected_text(format!("Color 1 {:?}", self.state.c1.to_string()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.state.c1, Vec4::new(1.0, 0.0, 0.0, 1.0), "Red");
+                    ui.selectable_value(&mut self.state.c1, Vec4::new(0.0, 0.0, 1.0, 1.0), "Blue");
+                });
+
+            egui::ComboBox::from_label("2")
+                .selected_text(format!("Color 2 {:?}", self.state.c2.to_string()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.state.c2,
+                        Vec4::new(1.0, 0.0, 1.0, 1.0),
+                        "Magenta",
+                    );
+                    ui.selectable_value(&mut self.state.c2, Vec4::new(0.0, 1.0, 0.0, 1.0), "Green");
+                });
+        });
+
+        let egui::FullOutput {
+            platform_output,
+            shapes,
+            textures_delta,
+            pixels_per_point,
+            ..
+        } = egui_ctx.end_pass();
+
+        self.state
+            .egui_state
+            .as_mut()
+            .unwrap()
+            .handle_platform_output(window, platform_output);
+
+        let primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+
+        if !textures_delta.set.is_empty() {
+            self.egui_renderer.as_mut().unwrap().set_textures(
+                self.state.graphics_queue,
+                frame.command_pool,
+                textures_delta.set.as_slice(),
+            )?;
+        }
+
         let cmd_begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
@@ -141,45 +268,90 @@ impl Engine {
 
         let image = self.state.swapchain_images[image_index as usize];
 
-        // transition the swapchain image into a format we can use
+        // transition the draw image into a format we can use
+        transition_image(
+            &self.device,
+            cmd,
+            self.state.draw_image.image,
+            ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
+        )?;
+
+        draw_background(&self.device, cmd, self.state.c1, self.state.c2, &self.state)?;
+
+        // transition swapchain image to transfer layouts
+        transition_image(
+            &self.device,
+            cmd,
+            self.state.draw_image.image,
+            ImageAspectFlags::COLOR,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        )?;
         transition_image(
             &self.device,
             cmd,
             image,
             ImageAspectFlags::COLOR,
             vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
 
-        let flash = f32::abs(f32::sin((self.state.frame_number / 120) as f32));
-        let clear_color = vk::ClearColorValue {
-            float32: [0.0, 0.0, flash, 1.0],
-        };
+        let extent = vk::Extent2D::default()
+            .width(self.state.draw_image.extent.width)
+            .height(self.state.draw_image.extent.height);
 
-        let clear_range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_mip_level(0)
-            .level_count(1)
-            .base_array_layer(0)
-            .layer_count(1);
+        // blit to swapchain
+        blit_image(
+            &self.device,
+            cmd,
+            self.state.draw_image.image,
+            image,
+            extent,
+            extent,
+        )?;
 
-        unsafe {
-            self.device.cmd_clear_color_image(
-                cmd,
-                image,
-                vk::ImageLayout::GENERAL,
-                &clear_color,
-                &[clear_range],
-            )
-        };
-
-        // transition swapchain image to the presentation layout
         transition_image(
             &self.device,
             cmd,
             image,
             ImageAspectFlags::COLOR,
-            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        )?;
+
+        let color_attachment_info = vk::RenderingAttachmentInfo::default()
+            .image_view(self.state.swapchain_image_views[image_index as usize])
+            .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+            .store_op(vk::AttachmentStoreOp::STORE);
+
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.state.swapchain_extent,
+            })
+            .layer_count(1)
+            .color_attachments(std::slice::from_ref(&color_attachment_info));
+
+        unsafe { self.device.cmd_begin_rendering(cmd, &rendering_info) };
+
+        self.egui_renderer.as_mut().unwrap().cmd_draw(
+            cmd,
+            self.state.swapchain_extent,
+            pixels_per_point,
+            &primitives,
+        )?;
+
+        unsafe { self.device.cmd_end_rendering(cmd) };
+
+        // transition swapchain to present mode
+        transition_image(
+            &self.device,
+            cmd,
+            image,
+            ImageAspectFlags::COLOR,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::PRESENT_SRC_KHR,
         )?;
 
@@ -234,6 +406,13 @@ impl Engine {
             (self.state.current_semaphore + 1) % self.state.swapchain_image_views.len();
         self.state.frame_number += 1;
 
+        if !textures_delta.free.is_empty() {
+            self.egui_renderer
+                .as_mut()
+                .unwrap()
+                .free_textures(&textures_delta.free)?;
+        }
+
         Ok(())
     }
 
@@ -241,6 +420,9 @@ impl Engine {
 
     fn destroy_swapchain(&mut self) {
         unsafe {
+            self.device
+                .destroy_descriptor_pool(self.state.descriptor_pool, None);
+
             self.state
                 .swapchain_image_views
                 .iter()
@@ -251,12 +433,33 @@ impl Engine {
                 .as_mut()
                 .unwrap()
                 .destroy_swapchain(self.state.swapchain, None);
+
+            self.device
+                .destroy_pipeline_layout(self.state.gradient_pipeline_layout, None);
+            self.device
+                .destroy_pipeline(self.state.gradient_pipeline, None);
         }
     }
 
     pub fn destroy(&mut self) -> Result<()> {
         unsafe {
             self.device.device_wait_idle()?;
+
+            let allocation = std::mem::take(&mut self.state.draw_image);
+
+            cleanup_image(
+                allocation,
+                self.allocator
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .as_deref_mut()
+                    .unwrap(),
+                &self.device,
+            )?;
+
+            self.state.egui_state = None;
+            self.egui_renderer = None;
 
             self.state.frames.iter_mut().for_each(|f| {
                 self.device.destroy_fence(f.render_fence, None);
@@ -271,10 +474,15 @@ impl Engine {
 
             self.destroy_swapchain();
 
+            self.device
+                .destroy_descriptor_set_layout(self.state.draw_image_descriptor_layout, None);
+
             self.state
                 .frames
                 .iter()
                 .for_each(|f| self.device.destroy_command_pool(f.command_pool, None));
+
+            self.allocator = None;
 
             self.device.destroy_device(None);
             self.state
@@ -625,6 +833,28 @@ pub fn create_swapchain(
     Ok(())
 }
 
+pub fn create_draw_image(
+    device: &Device,
+    allocator: &mut Allocator,
+    state: &mut EngineState,
+) -> Result<()> {
+    let extent = vk::Extent3D::default()
+        .width(state.swapchain_extent.width)
+        .height(state.swapchain_extent.height)
+        .depth(1);
+
+    let format = vk::Format::R16G16B16A16_SFLOAT;
+
+    let usage = vk::ImageUsageFlags::TRANSFER_SRC
+        | ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+
+    state.draw_image = create_image(device, allocator, extent, usage, format)?;
+
+    Ok(())
+}
+
 // #endregion
 
 // #region Command
@@ -700,6 +930,199 @@ pub fn create_allocator(
 
     let allocator = gpu_allocator::vulkan::Allocator::new(&allocator_create_info)?;
     Ok(allocator)
+}
+
+// #endregion
+
+// #region Draw
+
+pub fn draw_background(
+    device: &Device,
+    cmd: vk::CommandBuffer,
+    c1: Vec4,
+    c2: Vec4,
+    state: &EngineState,
+) -> Result<()> {
+    unsafe {
+        // bind the compute pipeline
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, state.gradient_pipeline);
+
+        // bind the descriptor sets
+        device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            state.gradient_pipeline_layout,
+            0,
+            &state.draw_image_descriptors[..],
+            &[],
+        );
+
+        let push_constants = PushConstants {
+            data1: c1.to_array(),
+            data2: c2.to_array(),
+            ..Default::default()
+        };
+
+        device.cmd_push_constants(
+            cmd,
+            state.gradient_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytemuck::cast_slice(&[push_constants]),
+        );
+
+        device.cmd_dispatch(
+            cmd,
+            f32::ceil(state.draw_image.extent.width as f32 / 16.0) as u32,
+            f32::ceil(state.draw_image.extent.height as f32 / 16.0) as u32,
+            1,
+        );
+    }
+
+    Ok(())
+}
+
+// #endregion
+
+// #region Descriptors
+
+pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()> {
+    let sizes = vec![PoolSizeRatio::new(vk::DescriptorType::STORAGE_IMAGE, 1f32)];
+
+    let pool = create_descriptor_pool(device, 10, sizes)?;
+
+    let image_binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .descriptor_count(1)
+        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE);
+
+    let layout = create_descriptor_set_layout(
+        device,
+        &[image_binding],
+        vk::DescriptorSetLayoutCreateFlags::empty(),
+    )?;
+
+    // allocate a descriptor set for the draw image
+    state.draw_image_descriptors = allocate_descriptor_sets(device, pool, layout)?;
+
+    let image_info = &[vk::DescriptorImageInfo::default()
+        .image_layout(vk::ImageLayout::GENERAL)
+        .image_view(state.draw_image.image_view)];
+
+    let image_write = vk::WriteDescriptorSet::default()
+        .dst_set(state.draw_image_descriptors[0])
+        .dst_binding(0)
+        .image_info(image_info)
+        .descriptor_count(1)
+        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE);
+
+    let image_writes = &[image_write];
+
+    unsafe { device.update_descriptor_sets(image_writes, &[] as &[vk::CopyDescriptorSet]) };
+
+    state.draw_image_descriptor_layout = layout;
+    state.descriptor_pool = pool;
+
+    Ok(())
+}
+
+// #endregion
+
+// #region Pipelines
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Pod, Zeroable)]
+struct PushConstants {
+    data1: [f32; 4],
+    data2: [f32; 4],
+    data3: [f32; 4],
+    data4: [f32; 4],
+}
+
+pub fn create_background_pipelines(device: &Device, state: &mut EngineState) -> Result<()> {
+    let layouts = &[state.draw_image_descriptor_layout];
+
+    let push_constant_ranges = &[vk::PushConstantRange::default()
+        .offset(0)
+        .size(std::mem::size_of::<PushConstants>() as u32)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+
+    let compute_layout_info = vk::PipelineLayoutCreateInfo::default()
+        .push_constant_ranges(push_constant_ranges)
+        .set_layouts(layouts);
+
+    state.gradient_pipeline_layout =
+        unsafe { device.create_pipeline_layout(&compute_layout_info, None)? };
+
+    let compute_shader_src = include_bytes!("../../../shaders/out/gradient_comp.spv");
+    let compute_module = create_shader_module(device, &compute_shader_src[..])?;
+
+    let compute_shader_stage = vk::PipelineShaderStageCreateInfo::default()
+        .module(compute_module)
+        .name(c"main")
+        .stage(vk::ShaderStageFlags::COMPUTE);
+
+    let compute_pipeline_info = vk::ComputePipelineCreateInfo::default()
+        .layout(state.gradient_pipeline_layout)
+        .stage(compute_shader_stage);
+
+    let compute_pipeline_infos = &[compute_pipeline_info];
+
+    state.gradient_pipeline = unsafe {
+        device
+            .create_compute_pipelines(vk::PipelineCache::null(), compute_pipeline_infos, None)
+            .expect("failed to create compute pipeline")[0]
+    };
+
+    unsafe {
+        device.destroy_shader_module(compute_module, None);
+    }
+
+    Ok(())
+}
+
+// #endregion
+
+// #region egui
+
+pub fn setup_egui(
+    window: &Window,
+    device: &Device,
+    allocator: &Arc<Mutex<Allocator>>,
+    state: &mut EngineState,
+) -> Result<Renderer> {
+    let gui_context = egui::Context::default();
+    gui_context.set_pixels_per_point(window.scale_factor() as _);
+
+    let viewport_id = gui_context.viewport_id();
+    let gui_state = egui_winit::State::new(
+        gui_context,
+        viewport_id,
+        &window,
+        Some(window.scale_factor() as _),
+        Some(winit::window::Theme::Dark),
+        None,
+    );
+
+    egui_extras::install_image_loaders(gui_state.egui_ctx());
+
+    let egui_renderer = Renderer::with_gpu_allocator(
+        allocator.clone(),
+        device.clone(),
+        egui_ash_renderer::DynamicRendering {
+            color_attachment_format: state.swapchain_format,
+            depth_attachment_format: None,
+        },
+        egui_ash_renderer::Options {
+            in_flight_frames: FRAME_OVERLAP,
+            ..Default::default()
+        },
+    )?;
+
+    state.egui_state = Some(gui_state);
+
+    Ok(egui_renderer)
 }
 
 // #endregion

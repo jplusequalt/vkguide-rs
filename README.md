@@ -12,12 +12,18 @@ You'll also need to have the [Vulkan SDK](https://www.lunarg.com/vulkan-sdk/) in
 
 ## Running the chapters
 
+The shaders need to be built first before running anything. The [compile_shaders.py](./compile_shaders.py) script will take care of this for you. This script assumes you installed the Vulkan SDK and thus have `glslc.exe` for compiling the GLSL into SPIR-V.
+
+```bash
+python compile_shaders.py
+```
+
 To run the code, specify a chapter with the `--bin` flag, e.g.:
 
-```
+```bash
 cargo run --bin chapter1
 ```
 
 ## Disclaimer
 
-There are no guarantees that this code works on any other platforms other than Windows 10. Feel free to create a pull request to add cross-compatibility if you want, but don't expect any help from me on this front.
+There are no guarantees that this code works on any platforms other than Windows 10. Feel free to create a pull request to add cross-compatibility if you want, but don't expect any help from me on this front.
