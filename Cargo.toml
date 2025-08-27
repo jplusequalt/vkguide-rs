@@ -28,6 +28,7 @@ pretty_env_logger = "0.5"
 thiserror = "1"
 winit = "0.30.12"
 anyhow = "1.0.99"
+bytemuck = "1.23.2"
 
 [[bin]]
 name = "chapter1"

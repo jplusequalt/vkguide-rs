@@ -51,6 +51,11 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        self.engine
+            .as_mut()
+            .unwrap()
+            .egui_window_event(self.window.as_ref().unwrap(), &event);
+
         match event {
             WindowEvent::CloseRequested => {
                 info!("Exiting ...");

@@ -4,7 +4,9 @@ use anyhow::{Result, anyhow};
 use ash::khr::{surface, synchronization2};
 use ash::vk::{ImageAspectFlags, ImageUsageFlags};
 use ash::{Device, Entry, Instance, ext::debug_utils, vk};
+use bytemuck::{Pod, Zeroable};
 use egui_ash_renderer::Renderer;
+use glam::Vec4;
 use gpu_allocator::vulkan::Allocator;
 use log::*;
 use std::collections::HashSet;
@@ -17,6 +19,7 @@ use vkguide_rs::vulkan::descriptors::{
     PoolSizeRatio, allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
 };
 use vkguide_rs::vulkan::pipelines::create_shader_module;
+use winit::event::WindowEvent;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::{raw_window_handle::HasDisplayHandle, window::Window};
 
@@ -73,6 +76,8 @@ pub struct EngineState {
     gradient_pipeline: vk::Pipeline,
     egui_state: Option<egui_winit::State>,
     fps: FPSCounter,
+    c1: Vec4,
+    c2: Vec4,
 }
 
 const FRAME_OVERLAP: usize = 2;
@@ -103,6 +108,8 @@ impl Engine {
                 None,
             )?
         };
+        state.c1 = Vec4::new(1.0, 0.0, 0.0, 1.0);
+        state.c2 = Vec4::new(1.0, 0.0, 1.0, 1.0);
 
         select_physical_device_and_queue_indices(&instance, &mut state)?;
 
@@ -171,6 +178,15 @@ impl Engine {
         })
     }
 
+    pub fn egui_window_event(&mut self, window: &Window, event: &WindowEvent) {
+        let _ = self
+            .state
+            .egui_state
+            .as_mut()
+            .unwrap()
+            .on_window_event(window, event);
+    }
+
     // #region render
 
     pub fn render(&mut self, window: &Window) -> Result<()> {
@@ -227,8 +243,26 @@ impl Engine {
         let egui_ctx = self.state.egui_state.as_ref().unwrap().egui_ctx().clone();
 
         egui_ctx.begin_pass(gui_input);
-        egui::Window::new("FPS Counter").show(&egui_ctx, |ui| {
+        egui::Window::new("Debug GUI").show(&egui_ctx, |ui| {
             ui.heading(format!("{:.2} fps", fps_avg));
+
+            egui::ComboBox::from_label("1")
+                .selected_text(format!("Color 1 {:?}", self.state.c1.to_string()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.state.c1, Vec4::new(1.0, 0.0, 0.0, 1.0), "Red");
+                    ui.selectable_value(&mut self.state.c1, Vec4::new(0.0, 0.0, 1.0, 1.0), "Blue");
+                });
+
+            egui::ComboBox::from_label("2")
+                .selected_text(format!("Color 2 {:?}", self.state.c2.to_string()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.state.c2,
+                        Vec4::new(1.0, 0.0, 1.0, 1.0),
+                        "Magenta",
+                    );
+                    ui.selectable_value(&mut self.state.c2, Vec4::new(0.0, 1.0, 0.0, 1.0), "Green");
+                });
         });
 
         let egui::FullOutput {
@@ -272,7 +306,7 @@ impl Engine {
             vk::ImageLayout::GENERAL,
         )?;
 
-        draw_background(&self.device, cmd, &self.state)?;
+        draw_background(&self.device, cmd, self.state.c1, self.state.c2, &self.state)?;
 
         // transition swapchain image to transfer layouts
         transition_image(
@@ -401,7 +435,10 @@ impl Engine {
         self.state.frame_number += 1;
 
         if !textures_delta.free.is_empty() {
-            self.egui_renderer.as_mut().unwrap().free_textures(&textures_delta.free)?;
+            self.egui_renderer
+                .as_mut()
+                .unwrap()
+                .free_textures(&textures_delta.free)?;
         }
 
         Ok(())
@@ -927,7 +964,13 @@ pub fn create_allocator(
 
 // #region Draw
 
-pub fn draw_background(device: &Device, cmd: vk::CommandBuffer, state: &EngineState) -> Result<()> {
+pub fn draw_background(
+    device: &Device,
+    cmd: vk::CommandBuffer,
+    c1: Vec4,
+    c2: Vec4,
+    state: &EngineState,
+) -> Result<()> {
     unsafe {
         // bind the compute pipeline
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, state.gradient_pipeline);
@@ -940,6 +983,20 @@ pub fn draw_background(device: &Device, cmd: vk::CommandBuffer, state: &EngineSt
             0,
             &state.draw_image_descriptors[..],
             &[],
+        );
+
+        let push_constants = PushConstants {
+            data1: c1.to_array(),
+            data2: c2.to_array(),
+            ..Default::default()
+        };
+
+        device.cmd_push_constants(
+            cmd,
+            state.gradient_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytemuck::cast_slice(&[push_constants]),
         );
 
         device.cmd_dispatch(
@@ -1002,9 +1059,26 @@ pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()>
 
 // #region Pipelines
 
+#[repr(C)]
+#[derive(Copy, Clone, Default, Pod, Zeroable)]
+struct PushConstants {
+    data1: [f32; 4],
+    data2: [f32; 4],
+    data3: [f32; 4],
+    data4: [f32; 4],
+}
+
 pub fn create_background_pipelines(device: &Device, state: &mut EngineState) -> Result<()> {
     let layouts = &[state.draw_image_descriptor_layout];
-    let compute_layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(layouts);
+
+    let push_constant_ranges = &[vk::PushConstantRange::default()
+        .offset(0)
+        .size(std::mem::size_of::<PushConstants>() as u32)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+
+    let compute_layout_info = vk::PipelineLayoutCreateInfo::default()
+        .push_constant_ranges(push_constant_ranges)
+        .set_layouts(layouts);
 
     state.gradient_pipeline_layout =
         unsafe { device.create_pipeline_layout(&compute_layout_info, None)? };
