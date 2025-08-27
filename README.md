@@ -27,3 +27,9 @@ cargo run --bin chapter1
 ## Disclaimer
 
 There are no guarantees that this code works on any platforms other than Windows 10. Feel free to create a pull request to add cross-compatibility if you want, but don't expect any help from me on this front.
+
+## Screenshots
+
+Here's a quick screengrab of the output for chapter 2:
+
+![chapter2 example](./assets/chapter2-output.PNG)
