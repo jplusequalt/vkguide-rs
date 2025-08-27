@@ -74,6 +74,8 @@ pub struct EngineState {
     draw_image_descriptor_layout: vk::DescriptorSetLayout,
     gradient_pipeline_layout: vk::PipelineLayout,
     gradient_pipeline: vk::Pipeline,
+    triangle_pipeline_layout: vk::PipelineLayout,
+    triangle_pipeline: vk::Pipeline,
     egui_state: Option<egui_winit::State>,
     fps: FPSCounter,
     c1: Vec4,
@@ -136,6 +138,8 @@ impl Engine {
         setup_descriptors(&device, &mut state)?;
 
         create_background_pipelines(&device, &mut state)?;
+
+        create_triangle_pipeline(&device, &mut state)?;
 
         let egui_renderer = setup_egui(window, &device, &allocator, &mut state)?;
 
@@ -280,13 +284,24 @@ impl Engine {
 
         draw_background(&self.device, cmd, self.state.c1, self.state.c2, &self.state)?;
 
-        // transition swapchain image to transfer layouts
         transition_image(
             &self.device,
             cmd,
             self.state.draw_image.image,
             ImageAspectFlags::COLOR,
             vk::ImageLayout::GENERAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        )?;
+
+        draw_geometry(&self.device, cmd, &self.state)?;
+
+        // transition swapchain image to transfer layouts
+        transition_image(
+            &self.device,
+            cmd,
+            self.state.draw_image.image,
+            ImageAspectFlags::COLOR,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         )?;
         transition_image(
@@ -982,6 +997,63 @@ pub fn draw_background(
     Ok(())
 }
 
+pub fn draw_geometry(device: &Device, cmd: vk::CommandBuffer, state: &EngineState) -> Result<()> {
+    let color_attachment = vk::RenderingAttachmentInfo::default()
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .image_view(state.draw_image.image_view);
+
+    let attachments = &[color_attachment];
+
+    let render_area = vk::Rect2D {
+        extent: vk::Extent2D {
+            width: state.draw_image.extent.width,
+            height: state.draw_image.extent.height,
+        },
+        offset: vk::Offset2D { x: 0, y: 0 },
+    };
+
+    let render_info = vk::RenderingInfo::default()
+        .layer_count(1)
+        .render_area(render_area)
+        .color_attachments(attachments);
+
+    unsafe {
+        device.cmd_begin_rendering(cmd, &render_info);
+
+        device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            state.triangle_pipeline,
+        );
+    }
+
+    let viewport = vk::Viewport::default()
+        .x(0.0)
+        .y(0.0)
+        .width(state.draw_image.extent.width as f32)
+        .height(state.draw_image.extent.height as f32)
+        .min_depth(0.0)
+        .max_depth(1.0);
+
+    let viewports = &[viewport];
+    unsafe {
+        device.cmd_set_viewport(cmd, 0, viewports);
+    }
+
+    let scissors = &[render_area];
+    unsafe {
+        device.cmd_set_scissor(cmd, 0, scissors);
+    }
+
+    unsafe { device.cmd_draw(cmd, 3, 1, 0, 0); }
+
+    unsafe { device.cmd_end_rendering(cmd); }
+
+    Ok(())
+}
+
 // #endregion
 
 // #region Descriptors
@@ -1078,6 +1150,140 @@ pub fn create_background_pipelines(device: &Device, state: &mut EngineState) -> 
     unsafe {
         device.destroy_shader_module(compute_module, None);
     }
+
+    Ok(())
+}
+
+pub fn create_triangle_pipeline(device: &Device, state: &mut EngineState) -> Result<()> {
+    let vert_shader_src = include_bytes!("../../../shaders/out/colored_triangle_vert.spv");
+    let frag_shader_src = include_bytes!("../../../shaders/out/colored_triangle_frag.spv");
+
+    let vert_module = create_shader_module(device, &vert_shader_src[..])?;
+    let frag_module = create_shader_module(device, &frag_shader_src[..])?;
+
+    let vert_stage = vk::PipelineShaderStageCreateInfo::default()
+        .module(vert_module)
+        .name(c"main")
+        .stage(vk::ShaderStageFlags::VERTEX);
+
+    let frag_stage = vk::PipelineShaderStageCreateInfo::default()
+        .module(frag_module)
+        .name(c"main")
+        .stage(vk::ShaderStageFlags::FRAGMENT);
+
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .primitive_restart_enable(false)
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+    // the viewport describes the region of the framebuffer we will be rendering to
+    // and is used to transform from image to framebuffer
+    // since the width/height of the window may differ from the swapchain images
+    // we make sure to specify the width and height using the swapchain width/height
+    let viewport = vk::Viewport::default()
+        .x(0.0)
+        .y(0.0)
+        .width(state.swapchain_extent.width as f32)
+        .height(state.swapchain_extent.height as f32)
+        // min value to use in depth buffer
+        .min_depth(0.0)
+        // max value to use in depth buffer
+        .max_depth(1.0);
+
+    // the scissor rectangle represents the part of an image where pixels will actually be stored
+    // any pixels outside this rectangle gets discarded by the rasterizer
+    // they function as a filter rather than a transformation like the viewport struct acts as
+    let scissor = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        // use the whole framebuffer
+        .extent(state.swapchain_extent);
+
+    // the viewport and scissor need to be combined into a single struct
+    // it's possible to use multiple viewports and scissor rectangles on some graphics cards
+    // which requires enabling a GPU feature at logical device creation
+    let viewports = &[viewport];
+    let scissors = &[scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewports(viewports)
+        .scissors(scissors);
+
+    let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::BACK)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_clamp_enable(false)
+        .line_width(1.0)
+        .depth_bias_enable(false);
+
+    let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
+        .sample_shading_enable(false)
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    let color_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(false);
+
+    let color_attachment_format = state.draw_image.format;
+    let depth_attachment_format = vk::Format::UNDEFINED;
+
+    let attachments = &[color_attachment];
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+        .logic_op_enable(false)
+        .logic_op(vk::LogicOp::COPY)
+        .attachments(attachments)
+        .blend_constants([0.0, 0.0, 0.0, 0.0]);
+
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(false)
+        .depth_write_enable(false)
+        .depth_compare_op(vk::CompareOp::NEVER)
+        // next three fields let you specify a range,
+        // and all fragments outside that range are discarded
+        .depth_bounds_test_enable(false)
+        .min_depth_bounds(0.0) // optional
+        .max_depth_bounds(1.0) // optional
+        .stencil_test_enable(false);
+
+    let dynamic_states = &[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(dynamic_states);
+
+    let stages = &[vert_stage, frag_stage];
+
+    let layout_info = vk::PipelineLayoutCreateInfo::default();
+
+    let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+
+    let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .input_assembly_state(&input_assembly)
+        .vertex_input_state(&vertex_input)
+        .stages(stages)
+        .dynamic_state(&dynamic_state)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization_state)
+        .color_blend_state(&color_blend_state)
+        .multisample_state(&multisample_state)
+        .depth_stencil_state(&depth_stencil)
+        .layout(layout);
+
+    let color_attachments_format = &[color_attachment_format];
+    let mut render_info = vk::PipelineRenderingCreateInfo::default()
+        .depth_attachment_format(depth_attachment_format)
+        .color_attachment_formats(color_attachments_format);
+
+    pipeline_info = pipeline_info.push_next(&mut render_info);
+
+    let pipeline_infos = &[pipeline_info];
+    let pipeline = unsafe {
+        device
+            .create_graphics_pipelines(vk::PipelineCache::null(), pipeline_infos, None)
+            .expect("failed to create graphics pipeline")[0]
+    };
+
+    state.triangle_pipeline_layout = layout;
+    state.triangle_pipeline = pipeline;
 
     Ok(())
 }
