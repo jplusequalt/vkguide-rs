@@ -435,6 +435,9 @@ impl Engine {
 
     fn destroy_swapchain(&mut self) {
         unsafe {
+            self.device.destroy_pipeline_layout(self.state.triangle_pipeline_layout, None);
+            self.device.destroy_pipeline(self.state.triangle_pipeline, None);
+
             self.device
                 .destroy_descriptor_pool(self.state.descriptor_pool, None);
 
@@ -1284,6 +1287,9 @@ pub fn create_triangle_pipeline(device: &Device, state: &mut EngineState) -> Res
 
     state.triangle_pipeline_layout = layout;
     state.triangle_pipeline = pipeline;
+
+    unsafe { device.destroy_shader_module(vert_module, None); }
+    unsafe { device.destroy_shader_module(frag_module, None); }
 
     Ok(())
 }
