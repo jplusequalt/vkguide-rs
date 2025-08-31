@@ -14,6 +14,7 @@ use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use std::u64;
 use vkguide_rs::utils::fps::FPSCounter;
 use vkguide_rs::vulkan::descriptors::{
     PoolSizeRatio, allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
@@ -80,6 +81,7 @@ pub struct EngineState {
     fps: FPSCounter,
     c1: Vec4,
     c2: Vec4,
+    immediate_command: ImmediateCommands,
 }
 
 const FRAME_OVERLAP: usize = 2;
@@ -89,6 +91,13 @@ pub struct FrameData {
     command_pool: vk::CommandPool,
     main_command_buffer: vk::CommandBuffer,
     render_fence: vk::Fence,
+}
+
+#[derive(Default)]
+pub struct ImmediateCommands {
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
 }
 
 impl Engine {
@@ -435,8 +444,10 @@ impl Engine {
 
     fn destroy_swapchain(&mut self) {
         unsafe {
-            self.device.destroy_pipeline_layout(self.state.triangle_pipeline_layout, None);
-            self.device.destroy_pipeline(self.state.triangle_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.state.triangle_pipeline_layout, None);
+            self.device
+                .destroy_pipeline(self.state.triangle_pipeline, None);
 
             self.device
                 .destroy_descriptor_pool(self.state.descriptor_pool, None);
@@ -895,6 +906,57 @@ pub fn create_commands(device: &Device, state: &mut EngineState) -> Result<()> {
             unsafe { device.allocate_command_buffers(&command_buffer_allocate_info)?[0] };
     }
 
+    // create commands for immediate commands
+    let imm_command_pool = unsafe { device.create_command_pool(&command_pool_info, None)? };
+
+    let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(imm_command_pool)
+        .command_buffer_count(1)
+        .level(vk::CommandBufferLevel::PRIMARY);
+
+    let imm_command_buffer =
+        unsafe { device.allocate_command_buffers(&command_buffer_allocate_info)?[0] };
+
+    state.immediate_command.command_pool = imm_command_pool;
+    state.immediate_command.command_buffer = imm_command_buffer;
+
+    Ok(())
+}
+
+pub fn begin_immediate_command(device: &Device, state: &mut EngineState) -> Result<()> {
+    unsafe {
+        device.reset_fences(&[state.immediate_command.fence])?;
+        device.reset_command_buffer(
+            state.immediate_command.command_buffer,
+            vk::CommandBufferResetFlags::empty(),
+        )?;
+    };
+
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+    unsafe { device.begin_command_buffer(state.immediate_command.command_buffer, &begin_info)? };
+
+    Ok(())
+}
+
+pub fn end_immediate_command(device: &Device, state: &mut EngineState) -> Result<()> {
+    unsafe { device.end_command_buffer(state.immediate_command.command_buffer)? };
+
+    let cmd_submit_info = &[vk::CommandBufferSubmitInfo::default()
+        .command_buffer(state.immediate_command.command_buffer)];
+    let submit_info = &[vk::SubmitInfo2::default().command_buffer_infos(cmd_submit_info)];
+
+    unsafe {
+        device.queue_submit2(
+            state.graphics_queue,
+            submit_info,
+            state.immediate_command.fence,
+        )?;
+
+        device.wait_for_fences(&[state.immediate_command.fence], true, u64::MAX)?
+    };
+
     Ok(())
 }
 
@@ -921,6 +983,8 @@ pub fn create_sync_objects(device: &Device, state: &mut EngineState) -> Result<(
     }
 
     state.current_semaphore = 0;
+
+    state.immediate_command.fence = unsafe { device.create_fence(&fence_info, None)? };
 
     Ok(())
 }
@@ -1050,9 +1114,13 @@ pub fn draw_geometry(device: &Device, cmd: vk::CommandBuffer, state: &EngineStat
         device.cmd_set_scissor(cmd, 0, scissors);
     }
 
-    unsafe { device.cmd_draw(cmd, 3, 1, 0, 0); }
+    unsafe {
+        device.cmd_draw(cmd, 3, 1, 0, 0);
+    }
 
-    unsafe { device.cmd_end_rendering(cmd); }
+    unsafe {
+        device.cmd_end_rendering(cmd);
+    }
 
     Ok(())
 }
@@ -1288,8 +1356,12 @@ pub fn create_triangle_pipeline(device: &Device, state: &mut EngineState) -> Res
     state.triangle_pipeline_layout = layout;
     state.triangle_pipeline = pipeline;
 
-    unsafe { device.destroy_shader_module(vert_module, None); }
-    unsafe { device.destroy_shader_module(frag_module, None); }
+    unsafe {
+        device.destroy_shader_module(vert_module, None);
+    }
+    unsafe {
+        device.destroy_shader_module(frag_module, None);
+    }
 
     Ok(())
 }

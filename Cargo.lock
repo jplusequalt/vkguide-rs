@@ -2504,6 +2504,7 @@ dependencies = [
  "gpu-allocator",
  "log",
  "png",
+ "presser",
  "pretty_env_logger",
  "thiserror 1.0.69",
  "winit",

@@ -25,8 +25,10 @@ impl<'a> GPUMeshBuffers<'a> {
     pub fn new(
         device: &Device,
         allocator: &mut Allocator,
-        num_indices: usize,
+        vertex_data: Vec<Vertex>,
         num_verts: usize,
+        indices: Vec<u32>,
+        num_indices: usize,
     ) -> Result<Self> {
         let vert_buffer_size = (num_verts * std::mem::size_of::<Vertex>()) as u64;
         let index_buffer_size = (num_indices * std::mem::size_of::<u32>()) as u64;
@@ -53,6 +55,17 @@ impl<'a> GPUMeshBuffers<'a> {
             vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
         let vertex_buffer_address =
             unsafe { device.get_buffer_device_address(&buffer_address_info) };
+
+        let mut staging = AllocatedBuffer::new(
+            device,
+            allocator,
+            vert_buffer_size + index_buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        )?;
+
+        presser::copy_from_slice_to_offset(&vertex_data[..], &mut staging.allocation, 0)?;
+        presser::copy_from_slice_to_offset(&indices[..], &mut staging.allocation, index_buffer_size as usize)?;
 
         Ok(Self {
             vertex_buffer,
