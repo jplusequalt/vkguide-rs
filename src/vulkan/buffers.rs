@@ -1,14 +1,14 @@
 use anyhow::Result;
 use ash::{Device, vk};
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator};
+use gpu_allocator::vulkan::{Allocation, Allocator};
 
-pub struct AllocatedBuffer<'a> {
+#[derive(Default)]
+pub struct AllocatedBuffer {
     pub buffer: vk::Buffer,
     pub allocation: Allocation,
-    pub allocation_info: AllocationCreateDesc<'a>,
 }
 
-impl<'a> AllocatedBuffer<'a> {
+impl AllocatedBuffer {
     pub fn new(
         device: &Device,
         allocator: &mut Allocator,
@@ -32,10 +32,22 @@ impl<'a> AllocatedBuffer<'a> {
 
         let allocation = allocator.allocate(&allocation_info)?;
 
-        Ok(Self {
-            buffer,
-            allocation,
-            allocation_info,
-        })
+        unsafe { device.bind_buffer_memory(buffer, allocation.memory(), 0)? }
+
+        Ok(Self { buffer, allocation })
     }
+}
+
+pub fn cleanup_buffer(
+    buffer: AllocatedBuffer,
+    device: &Device,
+    allocator: &mut Allocator,
+) -> Result<()> {
+    allocator.free(buffer.allocation)?;
+
+    unsafe {
+        device.destroy_buffer(buffer.buffer, None);
+    }
+
+    Ok(())
 }

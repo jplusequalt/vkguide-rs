@@ -6,7 +6,7 @@ use ash::vk::{ImageAspectFlags, ImageUsageFlags};
 use ash::{Device, Entry, Instance, ext::debug_utils, vk};
 use bytemuck::{Pod, Zeroable};
 use egui_ash_renderer::Renderer;
-use glam::Vec4;
+use glam::{Mat4, Vec4};
 use gpu_allocator::vulkan::Allocator;
 use log::*;
 use std::collections::HashSet;
@@ -16,10 +16,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::u64;
 use vkguide_rs::utils::fps::FPSCounter;
+use vkguide_rs::vulkan::buffers::{AllocatedBuffer, cleanup_buffer};
 use vkguide_rs::vulkan::descriptors::{
     PoolSizeRatio, allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
 };
 use vkguide_rs::vulkan::pipelines::create_shader_module;
+use vkguide_rs::vulkan::types::{GPUMeshBuffers, GPUPushConstants, Vertex};
 use winit::event::WindowEvent;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::{raw_window_handle::HasDisplayHandle, window::Window};
@@ -77,11 +79,14 @@ pub struct EngineState {
     gradient_pipeline: vk::Pipeline,
     triangle_pipeline_layout: vk::PipelineLayout,
     triangle_pipeline: vk::Pipeline,
+    mesh_pipeline_layout: vk::PipelineLayout,
+    mesh_pipeline: vk::Pipeline,
     egui_state: Option<egui_winit::State>,
     fps: FPSCounter,
     c1: Vec4,
     c2: Vec4,
     immediate_command: ImmediateCommands,
+    mesh_buffers: GPUMeshBuffers,
 }
 
 const FRAME_OVERLAP: usize = 2;
@@ -98,6 +103,39 @@ pub struct ImmediateCommands {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+}
+
+impl ImmediateCommands {
+    pub fn begin_immediate_command(&self, device: &Device) -> Result<()> {
+        unsafe {
+            device.reset_fences(&[self.fence])?;
+            device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+        };
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe { device.begin_command_buffer(self.command_buffer, &begin_info)? };
+
+        Ok(())
+    }
+
+    pub fn end_immediate_command(&self, device: &Device, queue: vk::Queue) -> Result<()> {
+        unsafe { device.end_command_buffer(self.command_buffer)? };
+
+        let cmd_submit_info =
+            &[vk::CommandBufferSubmitInfo::default().command_buffer(self.command_buffer)];
+        let submit_info = &[vk::SubmitInfo2::default().command_buffer_infos(cmd_submit_info)];
+
+        unsafe {
+            device.queue_submit2(queue, submit_info, self.fence)?;
+
+            device.wait_for_fences(&[self.fence], true, u64::MAX)?
+        };
+
+        Ok(())
+    }
 }
 
 impl Engine {
@@ -149,6 +187,14 @@ impl Engine {
         create_background_pipelines(&device, &mut state)?;
 
         create_triangle_pipeline(&device, &mut state)?;
+
+        create_mesh_pipeline(&device, &mut state)?;
+
+        init_default_data(
+            &device,
+            allocator.lock().as_deref_mut().unwrap(),
+            &mut state,
+        )?;
 
         let egui_renderer = setup_egui(window, &device, &allocator, &mut state)?;
 
@@ -485,6 +531,30 @@ impl Engine {
                     .as_deref_mut()
                     .unwrap(),
                 &self.device,
+            )?;
+
+            let allocation = std::mem::take(&mut self.state.mesh_buffers);
+
+            cleanup_buffer(
+                allocation.vertex_buffer,
+                &self.device,
+                self.allocator
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .as_deref_mut()
+                    .unwrap(),
+            )?;
+
+            cleanup_buffer(
+                allocation.index_buffer,
+                &self.device,
+                self.allocator
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .as_deref_mut()
+                    .unwrap(),
             )?;
 
             self.state.egui_state = None;
@@ -923,43 +993,6 @@ pub fn create_commands(device: &Device, state: &mut EngineState) -> Result<()> {
     Ok(())
 }
 
-pub fn begin_immediate_command(device: &Device, state: &mut EngineState) -> Result<()> {
-    unsafe {
-        device.reset_fences(&[state.immediate_command.fence])?;
-        device.reset_command_buffer(
-            state.immediate_command.command_buffer,
-            vk::CommandBufferResetFlags::empty(),
-        )?;
-    };
-
-    let begin_info =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-    unsafe { device.begin_command_buffer(state.immediate_command.command_buffer, &begin_info)? };
-
-    Ok(())
-}
-
-pub fn end_immediate_command(device: &Device, state: &mut EngineState) -> Result<()> {
-    unsafe { device.end_command_buffer(state.immediate_command.command_buffer)? };
-
-    let cmd_submit_info = &[vk::CommandBufferSubmitInfo::default()
-        .command_buffer(state.immediate_command.command_buffer)];
-    let submit_info = &[vk::SubmitInfo2::default().command_buffer_infos(cmd_submit_info)];
-
-    unsafe {
-        device.queue_submit2(
-            state.graphics_queue,
-            submit_info,
-            state.immediate_command.fence,
-        )?;
-
-        device.wait_for_fences(&[state.immediate_command.fence], true, u64::MAX)?
-    };
-
-    Ok(())
-}
-
 // #endregion
 
 // #region Synchronization
@@ -1116,6 +1149,30 @@ pub fn draw_geometry(device: &Device, cmd: vk::CommandBuffer, state: &EngineStat
 
     unsafe {
         device.cmd_draw(cmd, 3, 1, 0, 0);
+
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, state.mesh_pipeline);
+
+        let push_constants = GPUPushConstants {
+            world_matrix: Mat4::IDENTITY.to_cols_array_2d(),
+            vertex_buffer_address: state.mesh_buffers.vertex_buffer_address,
+        };
+
+        device.cmd_push_constants(
+            cmd,
+            state.mesh_pipeline_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            bytemuck::cast_slice(&[push_constants]),
+        );
+
+        device.cmd_bind_index_buffer(
+            cmd,
+            state.mesh_buffers.index_buffer.buffer,
+            0,
+            vk::IndexType::UINT32,
+        );
+
+        device.cmd_draw_indexed(cmd, 6, 1, 0, 0, 0);
     }
 
     unsafe {
@@ -1366,6 +1423,152 @@ pub fn create_triangle_pipeline(device: &Device, state: &mut EngineState) -> Res
     Ok(())
 }
 
+pub fn create_mesh_pipeline(device: &Device, state: &mut EngineState) -> Result<()> {
+    let vert_shader_src = include_bytes!("../../../shaders/out/colored_triangle_mesh_vert.spv");
+    let frag_shader_src = include_bytes!("../../../shaders/out/colored_triangle_frag.spv");
+
+    let vert_module = create_shader_module(device, &vert_shader_src[..])?;
+    let frag_module = create_shader_module(device, &frag_shader_src[..])?;
+
+    let vert_stage = vk::PipelineShaderStageCreateInfo::default()
+        .module(vert_module)
+        .name(c"main")
+        .stage(vk::ShaderStageFlags::VERTEX);
+
+    let frag_stage = vk::PipelineShaderStageCreateInfo::default()
+        .module(frag_module)
+        .name(c"main")
+        .stage(vk::ShaderStageFlags::FRAGMENT);
+
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .primitive_restart_enable(false)
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+    // the viewport describes the region of the framebuffer we will be rendering to
+    // and is used to transform from image to framebuffer
+    // since the width/height of the window may differ from the swapchain images
+    // we make sure to specify the width and height using the swapchain width/height
+    let viewport = vk::Viewport::default()
+        .x(0.0)
+        .y(0.0)
+        .width(state.swapchain_extent.width as f32)
+        .height(state.swapchain_extent.height as f32)
+        // min value to use in depth buffer
+        .min_depth(0.0)
+        // max value to use in depth buffer
+        .max_depth(1.0);
+
+    // the scissor rectangle represents the part of an image where pixels will actually be stored
+    // any pixels outside this rectangle gets discarded by the rasterizer
+    // they function as a filter rather than a transformation like the viewport struct acts as
+    let scissor = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        // use the whole framebuffer
+        .extent(state.swapchain_extent);
+
+    // the viewport and scissor need to be combined into a single struct
+    // it's possible to use multiple viewports and scissor rectangles on some graphics cards
+    // which requires enabling a GPU feature at logical device creation
+    let viewports = &[viewport];
+    let scissors = &[scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewports(viewports)
+        .scissors(scissors);
+
+    let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::BACK)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_clamp_enable(false)
+        .line_width(1.0)
+        .depth_bias_enable(false);
+
+    let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
+        .sample_shading_enable(false)
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    let color_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(false);
+
+    let color_attachment_format = state.draw_image.format;
+    let depth_attachment_format = vk::Format::UNDEFINED;
+
+    let attachments = &[color_attachment];
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+        .logic_op_enable(false)
+        .logic_op(vk::LogicOp::COPY)
+        .attachments(attachments)
+        .blend_constants([0.0, 0.0, 0.0, 0.0]);
+
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(false)
+        .depth_write_enable(false)
+        .depth_compare_op(vk::CompareOp::NEVER)
+        // next three fields let you specify a range,
+        // and all fragments outside that range are discarded
+        .depth_bounds_test_enable(false)
+        .min_depth_bounds(0.0) // optional
+        .max_depth_bounds(1.0) // optional
+        .stencil_test_enable(false);
+
+    let dynamic_states = &[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(dynamic_states);
+
+    let stages = &[vert_stage, frag_stage];
+
+    let buffer_range = &[vk::PushConstantRange::default()
+        .offset(0)
+        .size(size_of::<GPUMeshBuffers>() as u32)
+        .stage_flags(vk::ShaderStageFlags::VERTEX)];
+
+    let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(buffer_range);
+
+    let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+
+    let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .input_assembly_state(&input_assembly)
+        .vertex_input_state(&vertex_input)
+        .stages(stages)
+        .dynamic_state(&dynamic_state)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization_state)
+        .color_blend_state(&color_blend_state)
+        .multisample_state(&multisample_state)
+        .depth_stencil_state(&depth_stencil)
+        .layout(layout);
+
+    let color_attachments_format = &[color_attachment_format];
+    let mut render_info = vk::PipelineRenderingCreateInfo::default()
+        .depth_attachment_format(depth_attachment_format)
+        .color_attachment_formats(color_attachments_format);
+
+    pipeline_info = pipeline_info.push_next(&mut render_info);
+
+    let pipeline_infos = &[pipeline_info];
+    let pipeline = unsafe {
+        device
+            .create_graphics_pipelines(vk::PipelineCache::null(), pipeline_infos, None)
+            .expect("failed to create graphics pipeline")[0]
+    };
+
+    state.mesh_pipeline_layout = layout;
+    state.mesh_pipeline = pipeline;
+
+    unsafe {
+        device.destroy_shader_module(vert_module, None);
+    }
+    unsafe {
+        device.destroy_shader_module(frag_module, None);
+    }
+
+    Ok(())
+}
+
 // #endregion
 
 // #region egui
@@ -1407,6 +1610,142 @@ pub fn setup_egui(
     state.egui_state = Some(gui_state);
 
     Ok(egui_renderer)
+}
+
+// #endregion
+
+// #region Meshes
+
+pub fn create_mesh_buffer(
+    device: &Device,
+    allocator: &mut Allocator,
+    state: &mut EngineState,
+    vertex_data: Vec<Vertex>,
+    num_verts: usize,
+    indices: Vec<u32>,
+    num_indices: usize,
+) -> Result<GPUMeshBuffers> {
+    let vert_buffer_size = (num_verts * std::mem::size_of::<Vertex>()) as u64;
+    let index_buffer_size = (num_indices * std::mem::size_of::<u32>()) as u64;
+
+    let vertex_buffer = AllocatedBuffer::new(
+        device,
+        allocator,
+        vert_buffer_size,
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        gpu_allocator::MemoryLocation::GpuOnly,
+    )?;
+
+    let index_buffer = AllocatedBuffer::new(
+        device,
+        allocator,
+        index_buffer_size,
+        vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        gpu_allocator::MemoryLocation::GpuOnly,
+    )?;
+
+    let buffer_address_info = vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
+    let vertex_buffer_address = unsafe { device.get_buffer_device_address(&buffer_address_info) };
+
+    let mut staging = AllocatedBuffer::new(
+        device,
+        allocator,
+        vert_buffer_size + index_buffer_size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        gpu_allocator::MemoryLocation::CpuToGpu,
+    )?;
+
+    presser::copy_from_slice_to_offset(&vertex_data[..], &mut staging.allocation, 0)?;
+    presser::copy_from_slice_to_offset(
+        &indices[..],
+        &mut staging.allocation,
+        index_buffer_size as usize,
+    )?;
+
+    state.immediate_command.begin_immediate_command(device)?;
+
+    let vertex_copy = vk::BufferCopy::default()
+        .dst_offset(0)
+        .src_offset(0)
+        .size(vert_buffer_size);
+
+    let index_copy = vk::BufferCopy::default()
+        .dst_offset(0)
+        .src_offset(vert_buffer_size)
+        .size(index_buffer_size);
+
+    unsafe {
+        device.cmd_copy_buffer(
+            state.immediate_command.command_buffer,
+            staging.buffer,
+            vertex_buffer.buffer,
+            &[vertex_copy],
+        );
+
+        device.cmd_copy_buffer(
+            state.immediate_command.command_buffer,
+            staging.buffer,
+            index_buffer.buffer,
+            &[index_copy],
+        );
+    }
+
+    cleanup_buffer(staging, device, allocator)?;
+
+    let mesh_buffer = GPUMeshBuffers {
+        vertex_buffer,
+        index_buffer,
+        vertex_buffer_address,
+    };
+
+    Ok(mesh_buffer)
+}
+
+pub fn init_default_data(
+    device: &Device,
+    allocator: &mut Allocator,
+    state: &mut EngineState,
+) -> Result<()> {
+    let mut rect_verts = Vec::<Vertex>::new();
+
+    rect_verts.push(Vertex {
+        color: [0.0, 0.0, 0.0, 1.0],
+        position: [0.5, -0.5, 0.0],
+        ..Default::default()
+    });
+    rect_verts.push(Vertex {
+        color: [0.5, 0.5, 0.5, 1.0],
+        position: [0.5, 0.5, 0.0],
+        ..Default::default()
+    });
+    rect_verts.push(Vertex {
+        color: [1.0, 0.0, 0.0, 1.0],
+        position: [-0.5, -0.5, 0.0],
+        ..Default::default()
+    });
+    rect_verts.push(Vertex {
+        color: [0.0, 1.0, 0.0, 1.0],
+        position: [-0.5, 0.5, 0.0],
+        ..Default::default()
+    });
+    let vertices_len = rect_verts.len();
+
+    let rect_indices: Vec<u32> = vec![0, 1, 2, 2, 1, 3];
+    let indices_len = rect_indices.len();
+
+    state.mesh_buffers = create_mesh_buffer(
+        device,
+        allocator,
+        state,
+        rect_verts,
+        vertices_len,
+        rect_indices,
+        indices_len,
+    )?;
+
+    Ok(())
 }
 
 // #endregion
