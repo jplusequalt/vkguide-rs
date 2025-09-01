@@ -26,13 +26,13 @@ impl AllocatedBuffer {
             location,
             requirements,
             allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-            linear: false,
-            name: "test",
+            linear: true,
+            name: "buffer"
         };
 
         let allocation = allocator.allocate(&allocation_info)?;
 
-        unsafe { device.bind_buffer_memory(buffer, allocation.memory(), 0)? }
+        unsafe { device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())? }
 
         Ok(Self { buffer, allocation })
     }

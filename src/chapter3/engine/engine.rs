@@ -10,7 +10,7 @@ use glam::{Mat4, Vec4};
 use gpu_allocator::vulkan::Allocator;
 use log::*;
 use std::collections::HashSet;
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -131,7 +131,7 @@ impl ImmediateCommands {
         unsafe {
             device.queue_submit2(queue, submit_info, self.fence)?;
 
-            device.wait_for_fences(&[self.fence], true, u64::MAX)?
+            device.wait_for_fences(&[self.fence], true, 9999999999)?
         };
 
         Ok(())
@@ -496,6 +496,10 @@ impl Engine {
                 .destroy_pipeline(self.state.triangle_pipeline, None);
 
             self.device
+                .destroy_pipeline_layout(self.state.mesh_pipeline_layout, None);
+            self.device.destroy_pipeline(self.state.mesh_pipeline, None);
+
+            self.device
                 .destroy_descriptor_pool(self.state.descriptor_pool, None);
 
             self.state
@@ -533,10 +537,10 @@ impl Engine {
                 &self.device,
             )?;
 
-            let allocation = std::mem::take(&mut self.state.mesh_buffers);
+            let alloc = std::mem::take(&mut self.state.mesh_buffers);
 
             cleanup_buffer(
-                allocation.vertex_buffer,
+                alloc.vertex_buffer,
                 &self.device,
                 self.allocator
                     .as_mut()
@@ -547,7 +551,7 @@ impl Engine {
             )?;
 
             cleanup_buffer(
-                allocation.index_buffer,
+                alloc.index_buffer,
                 &self.device,
                 self.allocator
                     .as_mut()
@@ -571,10 +575,16 @@ impl Engine {
                     .destroy_semaphore(self.state.swapchain_semaphore[i], None);
             }
 
+            self.device
+                .destroy_fence(self.state.immediate_command.fence, None);
+
             self.destroy_swapchain();
 
             self.device
                 .destroy_descriptor_set_layout(self.state.draw_image_descriptor_layout, None);
+
+            self.device
+                .destroy_command_pool(self.state.immediate_command.command_pool, None);
 
             self.state
                 .frames
@@ -1152,8 +1162,9 @@ pub fn draw_geometry(device: &Device, cmd: vk::CommandBuffer, state: &EngineStat
 
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, state.mesh_pipeline);
 
+        let m = Mat4::IDENTITY;
         let push_constants = GPUPushConstants {
-            world_matrix: Mat4::IDENTITY.to_cols_array_2d(),
+            world_matrix: m.to_cols_array_2d(),
             vertex_buffer_address: state.mesh_buffers.vertex_buffer_address,
         };
 
@@ -1616,83 +1627,83 @@ pub fn setup_egui(
 
 // #region Meshes
 
+pub fn create_gpu_only_buffer_from_data<T: Copy>(
+    device: &Device,
+    allocator: &mut Allocator,
+    state: &mut EngineState,
+    usage: vk::BufferUsageFlags,
+    data: &[T],
+) -> Result<AllocatedBuffer> {
+    let size = size_of_val(data) as _;
+    let staging_buffer = AllocatedBuffer::new(
+        device,
+        allocator,
+        size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        gpu_allocator::MemoryLocation::CpuToGpu,
+    )?;
+
+    unsafe {
+        let data_ptr = staging_buffer.allocation.mapped_ptr().unwrap().as_ptr();
+        let mut align =
+            ash::util::Align::new(data_ptr, align_of::<T>() as _, size_of_val(data) as _);
+        align.copy_from_slice(data);
+    };
+
+    let buffer = AllocatedBuffer::new(
+        device,
+        allocator,
+        size,
+        usage | vk::BufferUsageFlags::TRANSFER_DST,
+        gpu_allocator::MemoryLocation::GpuOnly,
+    )?;
+
+    state.immediate_command.begin_immediate_command(device)?;
+
+    unsafe {
+        let region = vk::BufferCopy::default().size(size);
+        device.cmd_copy_buffer(
+            state.immediate_command.command_buffer,
+            staging_buffer.buffer,
+            buffer.buffer,
+            &[region],
+        );
+    }
+
+    state
+        .immediate_command
+        .end_immediate_command(device, state.graphics_queue)?;
+
+    cleanup_buffer(staging_buffer, device, allocator)?;
+
+    Ok(buffer)
+}
+
 pub fn create_mesh_buffer(
     device: &Device,
     allocator: &mut Allocator,
     state: &mut EngineState,
     vertex_data: Vec<Vertex>,
-    num_verts: usize,
     indices: Vec<u32>,
-    num_indices: usize,
 ) -> Result<GPUMeshBuffers> {
-    let vert_buffer_size = (num_verts * std::mem::size_of::<Vertex>()) as u64;
-    let index_buffer_size = (num_indices * std::mem::size_of::<u32>()) as u64;
-
-    let vertex_buffer = AllocatedBuffer::new(
+    let vertex_buffer = create_gpu_only_buffer_from_data(
         device,
         allocator,
-        vert_buffer_size,
-        vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_DST
-            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-        gpu_allocator::MemoryLocation::GpuOnly,
+        state,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        vertex_data.as_slice(),
     )?;
 
-    let index_buffer = AllocatedBuffer::new(
+    let info = vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
+    let vertex_buffer_address = unsafe { device.get_buffer_device_address(&info) };
+
+    let index_buffer = create_gpu_only_buffer_from_data(
         device,
         allocator,
-        index_buffer_size,
-        vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        gpu_allocator::MemoryLocation::GpuOnly,
+        state,
+        vk::BufferUsageFlags::INDEX_BUFFER,
+        indices.as_slice(),
     )?;
-
-    let buffer_address_info = vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
-    let vertex_buffer_address = unsafe { device.get_buffer_device_address(&buffer_address_info) };
-
-    let mut staging = AllocatedBuffer::new(
-        device,
-        allocator,
-        vert_buffer_size + index_buffer_size,
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        gpu_allocator::MemoryLocation::CpuToGpu,
-    )?;
-
-    presser::copy_from_slice_to_offset(&vertex_data[..], &mut staging.allocation, 0)?;
-    presser::copy_from_slice_to_offset(
-        &indices[..],
-        &mut staging.allocation,
-        index_buffer_size as usize,
-    )?;
-
-    state.immediate_command.begin_immediate_command(device)?;
-
-    let vertex_copy = vk::BufferCopy::default()
-        .dst_offset(0)
-        .src_offset(0)
-        .size(vert_buffer_size);
-
-    let index_copy = vk::BufferCopy::default()
-        .dst_offset(0)
-        .src_offset(vert_buffer_size)
-        .size(index_buffer_size);
-
-    unsafe {
-        device.cmd_copy_buffer(
-            state.immediate_command.command_buffer,
-            staging.buffer,
-            vertex_buffer.buffer,
-            &[vertex_copy],
-        );
-
-        device.cmd_copy_buffer(
-            state.immediate_command.command_buffer,
-            staging.buffer,
-            index_buffer.buffer,
-            &[index_copy],
-        );
-    }
-
-    cleanup_buffer(staging, device, allocator)?;
 
     let mesh_buffer = GPUMeshBuffers {
         vertex_buffer,
@@ -1713,37 +1724,35 @@ pub fn init_default_data(
     rect_verts.push(Vertex {
         color: [0.0, 0.0, 0.0, 1.0],
         position: [0.5, -0.5, 0.0],
-        ..Default::default()
+        uv_x: 0.0,
+        uv_y: 0.0,
+        normal: [1.0, 1.0, 1.0]
     });
     rect_verts.push(Vertex {
         color: [0.5, 0.5, 0.5, 1.0],
         position: [0.5, 0.5, 0.0],
-        ..Default::default()
+        uv_x: 0.0,
+        uv_y: 0.0,
+        normal: [1.0, 1.0, 1.0]
     });
     rect_verts.push(Vertex {
         color: [1.0, 0.0, 0.0, 1.0],
         position: [-0.5, -0.5, 0.0],
-        ..Default::default()
+        uv_x: 0.0,
+        uv_y: 0.0,
+        normal: [1.0, 1.0, 1.0]
     });
     rect_verts.push(Vertex {
         color: [0.0, 1.0, 0.0, 1.0],
         position: [-0.5, 0.5, 0.0],
-        ..Default::default()
+        uv_x: 0.0,
+        uv_y: 0.0,
+        normal: [1.0, 1.0, 1.0]
     });
-    let vertices_len = rect_verts.len();
 
     let rect_indices: Vec<u32> = vec![0, 1, 2, 2, 1, 3];
-    let indices_len = rect_indices.len();
 
-    state.mesh_buffers = create_mesh_buffer(
-        device,
-        allocator,
-        state,
-        rect_verts,
-        vertices_len,
-        rect_indices,
-        indices_len,
-    )?;
+    state.mesh_buffers = create_mesh_buffer(device, allocator, state, rect_verts, rect_indices)?;
 
     Ok(())
 }

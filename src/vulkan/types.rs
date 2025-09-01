@@ -10,7 +10,7 @@ use crate::vulkan::buffers::AllocatedBuffer;
 pub struct Vertex {
     pub position: [f32; 3],
     pub uv_x: f32,
-    pub normal: [f32; 4],
+    pub normal: [f32; 3],
     pub uv_y: f32,
     pub color: [f32; 4],
 }
