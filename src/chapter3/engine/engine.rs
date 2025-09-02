@@ -1722,32 +1722,32 @@ pub fn init_default_data(
     let mut rect_verts = Vec::<Vertex>::new();
 
     rect_verts.push(Vertex {
-        color: [0.0, 0.0, 0.0, 1.0],
         position: [0.5, -0.5, 0.0],
         uv_x: 0.0,
+        normal: [1.0, 1.0, 1.0],
         uv_y: 0.0,
-        normal: [1.0, 1.0, 1.0]
+        color: [0.0, 0.0, 0.0, 1.0],
     });
     rect_verts.push(Vertex {
-        color: [0.5, 0.5, 0.5, 1.0],
         position: [0.5, 0.5, 0.0],
         uv_x: 0.0,
+        normal: [1.0, 1.0, 1.0],
         uv_y: 0.0,
-        normal: [1.0, 1.0, 1.0]
+        color: [0.5, 0.5, 0.5, 1.0],
     });
     rect_verts.push(Vertex {
-        color: [1.0, 0.0, 0.0, 1.0],
         position: [-0.5, -0.5, 0.0],
         uv_x: 0.0,
+        normal: [1.0, 1.0, 1.0],
         uv_y: 0.0,
-        normal: [1.0, 1.0, 1.0]
+        color: [1.0, 0.0, 0.0, 1.0],
     });
     rect_verts.push(Vertex {
-        color: [0.0, 1.0, 0.0, 1.0],
         position: [-0.5, 0.5, 0.0],
         uv_x: 0.0,
+        normal: [1.0, 1.0, 1.0],
         uv_y: 0.0,
-        normal: [1.0, 1.0, 1.0]
+        color: [0.0, 1.0, 0.0, 1.0],
     });
 
     let rect_indices: Vec<u32> = vec![0, 1, 2, 2, 1, 3];
