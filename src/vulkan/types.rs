@@ -1,7 +1,5 @@
-use anyhow::Result;
-use ash::{Device, vk};
+use ash::vk;
 use bytemuck::{Zeroable, Pod};
-use gpu_allocator::vulkan::Allocator;
 
 use crate::vulkan::buffers::AllocatedBuffer;
 

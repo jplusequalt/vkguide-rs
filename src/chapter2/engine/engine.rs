@@ -16,16 +16,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use vkguide_rs::utils::fps::FPSCounter;
 use vkguide_rs::vulkan::descriptors::{
-    PoolSizeRatio, allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
+    DescriptorAllocator, PoolSizeRatio, create_descriptor_set_layout,
 };
 use vkguide_rs::vulkan::pipelines::create_shader_module;
 use winit::event::WindowEvent;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::{raw_window_handle::HasDisplayHandle, window::Window};
 
-use vkguide_rs::vulkan::images::{
-    AllocatedImage, blit_image, cleanup_image, create_image, create_image_view, transition_image,
-};
+use vkguide_rs::vulkan::images::{AllocatedImage, blit_image, create_image_view, transition_image};
 use vkguide_rs::vulkan::queue::QueueFamilyIndices;
 use vkguide_rs::vulkan::swapchain::SwapchainSupport;
 
@@ -69,7 +67,7 @@ pub struct EngineState {
     current_semaphore: usize,
     frame_number: usize,
     draw_image: AllocatedImage,
-    descriptor_pool: vk::DescriptorPool,
+    descriptor_allocator: DescriptorAllocator,
     draw_image_descriptors: Vec<vk::DescriptorSet>,
     draw_image_descriptor_layout: vk::DescriptorSetLayout,
     gradient_pipeline_layout: vk::PipelineLayout,
@@ -420,8 +418,7 @@ impl Engine {
 
     fn destroy_swapchain(&mut self) {
         unsafe {
-            self.device
-                .destroy_descriptor_pool(self.state.descriptor_pool, None);
+            self.state.descriptor_allocator.destroy(&self.device);
 
             self.state
                 .swapchain_image_views
@@ -445,17 +442,14 @@ impl Engine {
         unsafe {
             self.device.device_wait_idle()?;
 
-            let allocation = std::mem::take(&mut self.state.draw_image);
-
-            cleanup_image(
-                allocation,
+            self.state.draw_image.cleanup(
+                &self.device,
                 self.allocator
                     .as_mut()
                     .unwrap()
                     .lock()
                     .as_deref_mut()
                     .unwrap(),
-                &self.device,
             )?;
 
             self.state.egui_state = None;
@@ -850,7 +844,7 @@ pub fn create_draw_image(
         | vk::ImageUsageFlags::STORAGE
         | vk::ImageUsageFlags::COLOR_ATTACHMENT;
 
-    state.draw_image = create_image(device, allocator, extent, usage, format)?;
+    state.draw_image = AllocatedImage::new(device, allocator, extent, usage, format)?;
 
     Ok(())
 }
@@ -989,7 +983,7 @@ pub fn draw_background(
 pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()> {
     let sizes = vec![PoolSizeRatio::new(vk::DescriptorType::STORAGE_IMAGE, 1f32)];
 
-    let pool = create_descriptor_pool(device, 10, sizes)?;
+    let descriptor_allocator = DescriptorAllocator::new(device, 10, sizes)?;
 
     let image_binding = vk::DescriptorSetLayoutBinding::default()
         .binding(0)
@@ -1004,7 +998,7 @@ pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()>
     )?;
 
     // allocate a descriptor set for the draw image
-    state.draw_image_descriptors = allocate_descriptor_sets(device, pool, layout)?;
+    state.draw_image_descriptors = descriptor_allocator.allocate_descriptor_sets(device, layout)?;
 
     let image_info = &[vk::DescriptorImageInfo::default()
         .image_layout(vk::ImageLayout::GENERAL)
@@ -1022,7 +1016,7 @@ pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()>
     unsafe { device.update_descriptor_sets(image_writes, &[] as &[vk::CopyDescriptorSet]) };
 
     state.draw_image_descriptor_layout = layout;
-    state.descriptor_pool = pool;
+    state.descriptor_allocator = descriptor_allocator;
 
     Ok(())
 }

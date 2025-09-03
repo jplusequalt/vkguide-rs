@@ -12,63 +12,66 @@ pub struct AllocatedImage {
     pub format: vk::Format,
 }
 
-pub fn cleanup_image(
-    image: AllocatedImage,
-    allocator: &mut Allocator,
-    device: &Device,
-) -> Result<()> {
-    allocator.free(image.allocation)?;
+impl AllocatedImage {
+    pub fn new(
+        device: &Device,
+        allocator: &mut Allocator,
+        extent: vk::Extent3D,
+        usage: vk::ImageUsageFlags,
+        format: vk::Format,
+    ) -> Result<Self> {
+        let create_info = vk::ImageCreateInfo::default()
+            .extent(extent)
+            .format(format)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .mip_levels(1)
+            .image_type(vk::ImageType::TYPE_2D)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .array_layers(1)
+            .usage(usage);
 
-    unsafe {
-        device.destroy_image_view(image.image_view, None);
-        device.destroy_image(image.image, None);
+        let image = unsafe { device.create_image(&create_info, None)? };
+
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+
+        let allocation_info = gpu_allocator::vulkan::AllocationCreateDesc {
+            location: gpu_allocator::MemoryLocation::GpuOnly,
+            requirements,
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            linear: false,
+            name: "image",
+        };
+
+        let allocation = allocator.allocate(&allocation_info)?;
+
+        unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
+
+        let image_view = create_image_view(device, image, format, vk::ImageAspectFlags::COLOR)?;
+
+        Ok(Self {
+            image,
+            image_view,
+            allocation,
+            extent,
+            format,
+        })
     }
 
-    Ok(())
-}
+    pub fn cleanup(
+        &mut self,
+        device: &Device,
+        allocator: &mut Allocator,
+    ) -> Result<()> {
+        let image = std::mem::take(self);
+        allocator.free(image.allocation)?;
 
-pub fn create_image(
-    device: &Device,
-    allocator: &mut Allocator,
-    extent: vk::Extent3D,
-    usage: vk::ImageUsageFlags,
-    format: vk::Format,
-) -> Result<AllocatedImage> {
-    let create_info = vk::ImageCreateInfo::default()
-        .extent(extent)
-        .format(format)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .mip_levels(1)
-        .image_type(vk::ImageType::TYPE_2D)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .array_layers(1)
-        .usage(usage);
+        unsafe {
+            device.destroy_image_view(image.image_view, None);
+            device.destroy_image(image.image, None);
+        }
 
-    let image = unsafe { device.create_image(&create_info, None)? };
-
-    let requirements = unsafe { device.get_image_memory_requirements(image) };
-
-    let allocation_info = gpu_allocator::vulkan::AllocationCreateDesc {
-        location: gpu_allocator::MemoryLocation::GpuOnly,
-        requirements,
-        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-        linear: false,
-        name: "image",
-    };
-
-    let allocation = allocator.allocate(&allocation_info)?;
-
-    unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
-
-    let image_view = create_image_view(device, image, format, vk::ImageAspectFlags::COLOR)?;
-
-    Ok(AllocatedImage {
-        image,
-        image_view,
-        allocation,
-        extent,
-        format,
-    })
+        Ok(())
+    }
 }
 
 pub fn create_image_view(

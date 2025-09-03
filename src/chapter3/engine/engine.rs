@@ -10,15 +10,15 @@ use glam::{Mat4, Vec4};
 use gpu_allocator::vulkan::Allocator;
 use log::*;
 use std::collections::HashSet;
-use std::ffi::{CStr, c_char};
+use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::u64;
 use vkguide_rs::utils::fps::FPSCounter;
-use vkguide_rs::vulkan::buffers::{AllocatedBuffer, cleanup_buffer};
+use vkguide_rs::vulkan::buffers::AllocatedBuffer;
 use vkguide_rs::vulkan::descriptors::{
-    PoolSizeRatio, allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
+    DescriptorAllocator, PoolSizeRatio, create_descriptor_set_layout,
 };
 use vkguide_rs::vulkan::pipelines::create_shader_module;
 use vkguide_rs::vulkan::types::{GPUMeshBuffers, GPUPushConstants, Vertex};
@@ -26,9 +26,7 @@ use winit::event::WindowEvent;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::{raw_window_handle::HasDisplayHandle, window::Window};
 
-use vkguide_rs::vulkan::images::{
-    AllocatedImage, blit_image, cleanup_image, create_image, create_image_view, transition_image,
-};
+use vkguide_rs::vulkan::images::{AllocatedImage, blit_image, create_image_view, transition_image};
 use vkguide_rs::vulkan::queue::QueueFamilyIndices;
 use vkguide_rs::vulkan::swapchain::SwapchainSupport;
 
@@ -72,7 +70,7 @@ pub struct EngineState {
     current_semaphore: usize,
     frame_number: usize,
     draw_image: AllocatedImage,
-    descriptor_pool: vk::DescriptorPool,
+    descriptor_allocator: DescriptorAllocator,
     draw_image_descriptors: Vec<vk::DescriptorSet>,
     draw_image_descriptor_layout: vk::DescriptorSetLayout,
     gradient_pipeline_layout: vk::PipelineLayout,
@@ -106,7 +104,12 @@ pub struct ImmediateCommands {
 }
 
 impl ImmediateCommands {
-    pub fn begin_immediate_command(&self, device: &Device) -> Result<()> {
+    pub fn immediate_submit(
+        &self,
+        device: &Device,
+        queue: vk::Queue,
+        callback: impl FnOnce(vk::CommandBuffer) -> (),
+    ) -> Result<()> {
         unsafe {
             device.reset_fences(&[self.fence])?;
             device
@@ -118,10 +121,8 @@ impl ImmediateCommands {
 
         unsafe { device.begin_command_buffer(self.command_buffer, &begin_info)? };
 
-        Ok(())
-    }
+        callback(self.command_buffer);
 
-    pub fn end_immediate_command(&self, device: &Device, queue: vk::Queue) -> Result<()> {
         unsafe { device.end_command_buffer(self.command_buffer)? };
 
         let cmd_submit_info =
@@ -499,8 +500,7 @@ impl Engine {
                 .destroy_pipeline_layout(self.state.mesh_pipeline_layout, None);
             self.device.destroy_pipeline(self.state.mesh_pipeline, None);
 
-            self.device
-                .destroy_descriptor_pool(self.state.descriptor_pool, None);
+            self.state.descriptor_allocator.destroy(&self.device);
 
             self.state
                 .swapchain_image_views
@@ -524,23 +524,7 @@ impl Engine {
         unsafe {
             self.device.device_wait_idle()?;
 
-            let allocation = std::mem::take(&mut self.state.draw_image);
-
-            cleanup_image(
-                allocation,
-                self.allocator
-                    .as_mut()
-                    .unwrap()
-                    .lock()
-                    .as_deref_mut()
-                    .unwrap(),
-                &self.device,
-            )?;
-
-            let alloc = std::mem::take(&mut self.state.mesh_buffers);
-
-            cleanup_buffer(
-                alloc.vertex_buffer,
+            self.state.draw_image.cleanup(
                 &self.device,
                 self.allocator
                     .as_mut()
@@ -550,8 +534,17 @@ impl Engine {
                     .unwrap(),
             )?;
 
-            cleanup_buffer(
-                alloc.index_buffer,
+            self.state.mesh_buffers.vertex_buffer.cleanup(
+                &self.device,
+                self.allocator
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .as_deref_mut()
+                    .unwrap(),
+            )?;
+
+            self.state.mesh_buffers.index_buffer.cleanup(
                 &self.device,
                 self.allocator
                     .as_mut()
@@ -596,14 +589,14 @@ impl Engine {
             self.device.destroy_device(None);
             self.state
                 .surface_functions
-                .as_mut()
+                .as_ref()
                 .unwrap()
                 .destroy_surface(self.state.surface, None);
 
             if VALIDATION_ENABLED {
                 self.state
                     .debug_utils
-                    .as_mut()
+                    .as_ref()
                     .unwrap()
                     .destroy_debug_utils_messenger(
                         self.state.debug_messenger.take().unwrap(),
@@ -959,7 +952,7 @@ pub fn create_draw_image(
         | vk::ImageUsageFlags::STORAGE
         | vk::ImageUsageFlags::COLOR_ATTACHMENT;
 
-    state.draw_image = create_image(device, allocator, extent, usage, format)?;
+    state.draw_image = AllocatedImage::new(device, allocator, extent, usage, format)?;
 
     Ok(())
 }
@@ -1200,7 +1193,7 @@ pub fn draw_geometry(device: &Device, cmd: vk::CommandBuffer, state: &EngineStat
 pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()> {
     let sizes = vec![PoolSizeRatio::new(vk::DescriptorType::STORAGE_IMAGE, 1f32)];
 
-    let pool = create_descriptor_pool(device, 10, sizes)?;
+    let descriptor_allocator = DescriptorAllocator::new(device, 10, sizes)?;
 
     let image_binding = vk::DescriptorSetLayoutBinding::default()
         .binding(0)
@@ -1215,7 +1208,7 @@ pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()>
     )?;
 
     // allocate a descriptor set for the draw image
-    state.draw_image_descriptors = allocate_descriptor_sets(device, pool, layout)?;
+    state.draw_image_descriptors = descriptor_allocator.allocate_descriptor_sets(device, layout)?;
 
     let image_info = &[vk::DescriptorImageInfo::default()
         .image_layout(vk::ImageLayout::GENERAL)
@@ -1233,7 +1226,7 @@ pub fn setup_descriptors(device: &Device, state: &mut EngineState) -> Result<()>
     unsafe { device.update_descriptor_sets(image_writes, &[] as &[vk::CopyDescriptorSet]) };
 
     state.draw_image_descriptor_layout = layout;
-    state.descriptor_pool = pool;
+    state.descriptor_allocator = descriptor_allocator;
 
     Ok(())
 }
@@ -1635,7 +1628,7 @@ pub fn create_gpu_only_buffer_from_data<T: Copy>(
     data: &[T],
 ) -> Result<AllocatedBuffer> {
     let size = size_of_val(data) as _;
-    let staging_buffer = AllocatedBuffer::new(
+    let mut staging_buffer = AllocatedBuffer::new(
         device,
         allocator,
         size,
@@ -1658,23 +1651,14 @@ pub fn create_gpu_only_buffer_from_data<T: Copy>(
         gpu_allocator::MemoryLocation::GpuOnly,
     )?;
 
-    state.immediate_command.begin_immediate_command(device)?;
-
-    unsafe {
-        let region = vk::BufferCopy::default().size(size);
-        device.cmd_copy_buffer(
-            state.immediate_command.command_buffer,
-            staging_buffer.buffer,
-            buffer.buffer,
-            &[region],
-        );
-    }
-
     state
         .immediate_command
-        .end_immediate_command(device, state.graphics_queue)?;
+        .immediate_submit(device, state.graphics_queue, |cmd| unsafe {
+            let region = vk::BufferCopy::default().size(size);
+            device.cmd_copy_buffer(cmd, staging_buffer.buffer, buffer.buffer, &[region]);
+        })?;
 
-    cleanup_buffer(staging_buffer, device, allocator)?;
+    staging_buffer.cleanup(device, allocator)?;
 
     Ok(buffer)
 }

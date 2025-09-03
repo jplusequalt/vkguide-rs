@@ -27,7 +27,7 @@ impl AllocatedBuffer {
             requirements,
             allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
             linear: true,
-            name: "buffer"
+            name: "buffer",
         };
 
         let allocation = allocator.allocate(&allocation_info)?;
@@ -36,18 +36,15 @@ impl AllocatedBuffer {
 
         Ok(Self { buffer, allocation })
     }
-}
 
-pub fn cleanup_buffer(
-    buffer: AllocatedBuffer,
-    device: &Device,
-    allocator: &mut Allocator,
-) -> Result<()> {
-    allocator.free(buffer.allocation)?;
+    pub fn cleanup(&mut self, device: &Device, allocator: &mut Allocator) -> Result<()> {
+        let buffer = std::mem::take(self);
+        allocator.free(buffer.allocation)?;
 
-    unsafe {
-        device.destroy_buffer(buffer.buffer, None);
+        unsafe {
+            device.destroy_buffer(buffer.buffer, None);
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
